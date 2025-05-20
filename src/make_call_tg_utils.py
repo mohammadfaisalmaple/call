@@ -265,10 +265,19 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
             return False
         return True
 
+    def is_keyboard_open(device_id: str) -> bool:
+        """Check if the soft keyboard is open using dumpsys input_method."""
+        trace_logger = logger.bind(call_trace=True, call_id=device_id)
+        proc = run([ADB, "-s", device_id, "shell", "dumpsys", "input_method"])
+        if proc.returncode != 0:
+            trace_logger.info(f"[is_keyboard_open] dumpsys error => {proc.stderr}")
+            return False
+        return "mInputShown=true" in proc.stdout
 
     trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
     if find_element("Attach media"):
-        run([ADB, "-s", device_id, "shell", "input", "keyevent", "4"])
+        if is_keyboard_open(device_id):
+            run([ADB, "-s", device_id, "shell", "input", "keyevent", "4"])
 
     trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
     if not find_and_tap("Call"):
