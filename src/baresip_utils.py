@@ -252,11 +252,14 @@ class BaresipManager:
             self.running = False
             
 
+
+
     def _parse_event(self, line: str) -> None:
         logger.debug("[BaresipManager] Parsing event: %s", line)
         lower = line.lower().strip()  # إزالة المسافات البيضاء
         if "registered" in lower and "ua" in lower:
             self.registered = True
+            logger.info("[BaresipManager] SIP registration successful")
             log_state(
                 state_code="SIP_REGISTRATION_OK",
                 operation="call_mode",
@@ -265,7 +268,7 @@ class BaresipManager:
                 details=self._details(),
                 description="Account registered with Asterisk"
             )
-        elif "incoming call from" in lower or "call from" in lower:
+        elif "incoming call from" in lower:
             logger.info("[BaresipManager] Detected incoming call: %s", line)
             log_state(
                 state_code="SIP_CALL_INCOMING",
@@ -273,7 +276,7 @@ class BaresipManager:
                 action="incoming_detect",
                 status="initiated",
                 details=self._details(),
-                description="incoming call detected"
+                description="Incoming call detected"
             )
             try:
                 self._send_cmd('{"command":"answer","params":{}}')
@@ -284,7 +287,7 @@ class BaresipManager:
                     action="answer_call",
                     status="success",
                     details=self._details(),
-                    description="call answered via baresip"
+                    description="Call answered via baresip"
                 )
             except Exception as e:
                 logger.error("[BaresipManager] Failed to send answer command: %s", str(e))
@@ -297,22 +300,24 @@ class BaresipManager:
                     description=f"Failed to answer call: {str(e)}"
                 )
         elif "answered" in lower:
+            logger.info("[BaresipManager] Call confirmed")
             log_state(
                 state_code="SIP_CALL_CONFIRMED",
                 operation="call_mode",
                 action="call_confirmed",
                 status="success",
                 details=self._details(),
-                description="call answered/confirmed"
+                description="Call answered/confirmed"
             )
         elif "closed" in lower and "call" in lower:
+            logger.info("[BaresipManager] Call disconnected")
             log_state(
                 state_code="SIP_CALL_DISCONNECTED",
                 operation="call_mode",
                 action="call_closed",
                 status="success",
                 details=self._details(),
-                description="call closed"
+                description="Call closed"
             )
 
     def _send_cmd(self, cmd: str) -> None:
@@ -326,10 +331,11 @@ class BaresipManager:
             netstring = f"{len(cmd_bytes)}:{cmd},".encode("utf-8")
             logger.debug("[BaresipManager] Sending netstring command: %s", netstring)
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(2)  # زيادة المهلة إلى ثانيتين
+                s.settimeout(5)  # زيادة المهلة إلى 5 ثوانٍ
                 s.connect((host, port))
                 s.sendall(netstring)
-                logger.info("[BaresipManager] Successfully sent command: %s", cmd)
+                response = s.recv(4096).decode()  # محاولة قراءة الرد
+                logger.info("[BaresipManager] Successfully sent command: %s, response: %s", cmd, response)
         except Exception as exc:
             logger.error("[BaresipManager] TCP write failed: %s", str(exc))
             raise
