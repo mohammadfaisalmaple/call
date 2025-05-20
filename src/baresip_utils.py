@@ -77,7 +77,8 @@ class BaresipManager:
 
     def ensure_connected(self, timeout: int = 10) -> bool:
         """Ensure Baresip is registered with Asterisk."""
-        if not self.running:
+        logger.info("[ensure_connected]")
+        if self.running:
             self.start()
         return self.wait_registered(timeout=timeout)
 
@@ -87,10 +88,13 @@ class BaresipManager:
 
     def wait_registered(self, timeout: int = 10) -> bool:
         """Wait for registration with Asterisk."""
+        logger.info("[wait_registered]")
         for _ in range(timeout * 10):
             if self.registered:
+                logger.info("[wait_registered] true")
                 return True
             time.sleep(0.1)
+        logger.info("[wait_registered] false")    
         return False
 
     def answer_call(self) -> None:
