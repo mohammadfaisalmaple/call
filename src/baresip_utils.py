@@ -220,15 +220,18 @@ class BaresipManager:
 
     def _stdout_reader(self) -> None:
         assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
-            line = line.rstrip()
-            if not line:
-                continue
-            logger.debug("[baresip] RAW OUTPUT: %s", line)  # تسجيل كل سطر خام
-            self._parse_event(line)
-            if not self.running:
-                break
-            time.sleep(0.1)
+        try:
+            for line in self.proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                logger.debug("[baresip] RAW OUTPUT: %s", line)
+                self._parse_event(line)
+                if not self.running:
+                    break
+                time.sleep(0.1)
+        except Exception as e:
+            logger.error("[BaresipManager] Error in stdout_reader: %s", str(e))
             
     def _parse_event(self, line: str) -> None:
         """Parse Baresip output events."""

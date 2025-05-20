@@ -11,7 +11,7 @@ import logging
 class Logger:
     def __init__(self):
         self.logger = logging.getLogger("telegram_call")
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(logging.DEBUG)
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
         self.logger.addHandler(handler)
