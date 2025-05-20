@@ -274,7 +274,6 @@ class BaresipManager:
 
     
      
-
     def _spawn_process(self) -> None:
         """Spawn Baresip subprocess."""
         env = os.environ.copy()
@@ -282,11 +281,28 @@ class BaresipManager:
         env["LD_LIBRARY_PATH"] = "/usr/local/lib/baresip/modules:" + env.get("LD_LIBRARY_PATH", "")
         cmd = [self.baresip_bin, "-f", str(self.cfg_dir), "-m", "ctrl_tcp"]
         logger.info("[BaresipManager] Starting baresip with command: %s", cmd)
-        self.proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
-        )
-        logger.info("[BaresipManager] Started PID %s", self.proc.pid)
-        
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                bufsize=1,
+                universal_newlines=True
+            )
+            logger.info("[BaresipManager] Started PID %s", self.proc.pid)
+            
+            # التحقق من حالة العملية
+            time.sleep(1)
+            if self.proc.poll() is not None:
+                stderr_output = self.proc.stderr.read() if self.proc.stderr else "No stderr"
+                logger.error("[BaresipManager] Baresip terminated early: %s", stderr_output)
+                raise RuntimeError("Baresip process failed to start")
+        except Exception as e:
+            logger.error("[BaresipManager] Failed to start baresip: %s", str(e))
+            raise
+
         # التحقق من واجهة ctrl_tcp
         for _ in range(100):  # 10 ثوانٍ
             try:
@@ -301,9 +317,11 @@ class BaresipManager:
                 logger.debug("[BaresipManager] ctrl_tcp not yet available: %s", str(e))
                 time.sleep(0.1)
             finally:
-                s.close()
+                if 's' in locals():
+                    s.close()
         else:
-            logger.error("[BaresipManager] Failed to connect to ctrl_tcp after retries")
+            stderr_output = self.proc.stderr.read() if self.proc.stderr else "No stderr"
+            logger.error("[BaresipManager] Failed to connect to ctrl_tcp: %s", stderr_output)
             if self.proc:
                 self.proc.terminate()
                 try:
@@ -311,70 +329,94 @@ class BaresipManager:
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
             raise RuntimeError("ctrl_tcp not available for baresip")
-        
-        # قراءة إخراج baresip للتحقق من التسجيل
-        output = ""
-        for _ in range(300):  # قراءة لمدة 30 ثانية
-            line = self.proc.stdout.readline() if self.proc.stdout else ""
-            if not line:
-                break
-            output += line
-            if "useragent registered successfully" in line.lower():
-                logger.info("[BaresipManager] SIP registration successful: %s", line.strip())
-                self.registered = True
-            elif "connection timed out" in line.lower():
-                logger.error("[BaresipManager] SIP registration failed: %s", line.strip())
-            elif "ctrl_tcp" in line.lower():
-                logger.error("[BaresipManager] ctrl_tcp error: %s", line.strip())
-        logger.debug("[BaresipManager] baresip initial output: %s", output)
 
     def _stdout_reader(self) -> None:
         assert self.proc and self.proc.stdout
         try:
-            for line in self.proc.stdout:
-                line = line.rstrip()
+            logger.info("[BaresipManager] Starting stdout reader thread")
+            while self.running:
+                line = self.proc.stdout.readline().rstrip()
                 if not line:
+                    if self.proc.poll() is not None:
+                        stderr_output = self.proc.stderr.read() if self.proc.stderr else "No stderr"
+                        logger.error("[BaresipManager] Baresip process terminated: %s", stderr_output)
+                        self.running = False
+                        break
+                    logger.debug("[BaresipManager] Empty line received, continuing...")
+                    time.sleep(0.01)
                     continue
                 logger.debug("[baresip] RAW OUTPUT: %s", line)
                 self._parse_event(line)
-                if not self.running:
-                    break
-                time.sleep(0.1)
         except Exception as e:
             logger.error("[BaresipManager] Error in stdout_reader: %s", str(e))
+            self.running = False
             
+
     def _parse_event(self, line: str) -> None:
         logger.debug("[BaresipManager] Parsing event: %s", line)
-        lower = line.lower()
+        lower = line.lower().strip()  # إزالة المسافات البيضاء
         if "registered" in lower and "ua" in lower:
             self.registered = True
+            logger.info("[BaresipManager] SIP registration successful")
             log_state(
-                state_code="SIP_REGISTRATION_OK", operation="call_mode", action="register_sip_account",
-                status="success", details=self._details(), description="Account registered with Asterisk"
+                state_code="SIP_REGISTRATION_OK",
+                operation="call_mode",
+                action="register_sip_account",
+                status="success",
+                details=self._details(),
+                description="Account registered with Asterisk"
             )
-        elif "incoming call from" in lower and "sip:" in lower:  # اكتشاف مكالمة واردة
+        elif "incoming call from" in lower:
+            logger.info("[BaresipManager] Detected incoming call: %s", line)
             log_state(
-                state_code="SIP_CALL_INCOMING", operation="call_mode", action="incoming_detect",
-                status="initiated", details=self._details(), description="incoming call detected"
+                state_code="SIP_CALL_INCOMING",
+                operation="call_mode",
+                action="incoming_detect",
+                status="initiated",
+                details=self._details(),
+                description="Incoming call detected"
             )
-            # قبول المكالمة تلقائيًا دون call_id
-            self._send_cmd('{"command":"answer","params":{}}')
-            logger.info("[BaresipManager] Auto-answered incoming call")
-            log_state(
-                state_code="SIP_CALL_ANSWERED", operation="call_mode", action="answer_call",
-                status="success", details=self._details(), description="call answered via baresip"
-            )
+            try:
+                self._send_cmd('{"command":"answer","params":{}}')
+                logger.info("[BaresipManager] Auto-answered incoming call")
+                log_state(
+                    state_code="SIP_CALL_ANSWERED",
+                    operation="call_mode",
+                    action="answer_call",
+                    status="success",
+                    details=self._details(),
+                    description="Call answered via baresip"
+                )
+            except Exception as e:
+                logger.error("[BaresipManager] Failed to send answer command: %s", str(e))
+                log_state(
+                    state_code="SIP_CALL_ANSWER_FAILED",
+                    operation="call_mode",
+                    action="answer_call",
+                    status="failed",
+                    details=self._details(),
+                    description=f"Failed to answer call: {str(e)}"
+                )
         elif "answered" in lower:
+            logger.info("[BaresipManager] Call confirmed")
             log_state(
-                state_code="SIP_CALL_CONFIRMED", operation="call_mode", action="call_confirmed",
-                status="success", details=self._details(), description="call answered/confirmed"
+                state_code="SIP_CALL_CONFIRMED",
+                operation="call_mode",
+                action="call_confirmed",
+                status="success",
+                details=self._details(),
+                description="Call answered/confirmed"
             )
         elif "closed" in lower and "call" in lower:
+            logger.info("[BaresipManager] Call disconnected")
             log_state(
-                state_code="SIP_CALL_DISCONNECTED", operation="call_mode", action="call_closed",
-                status="success", details=self._details(), description="call closed"
+                state_code="SIP_CALL_DISCONNECTED",
+                operation="call_mode",
+                action="call_closed",
+                status="success",
+                details=self._details(),
+                description="Call closed"
             )
-
 
     def _send_cmd(self, cmd: str) -> None:
         if not self.cmd_fifo or not self.cmd_fifo.startswith("tcp:"):
@@ -383,16 +425,19 @@ class BaresipManager:
         try:
             host, port = self.cmd_fifo.replace("tcp:", "").split(":")
             port = int(port)
-            # تنسيق netstring: <length>:<command>,
             cmd_bytes = cmd.encode("utf-8")
             netstring = f"{len(cmd_bytes)}:{cmd},".encode("utf-8")
+            logger.debug("[BaresipManager] Sending netstring command: %s", netstring)
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(5)  # مهلة 5 ثوانٍ
                 s.connect((host, port))
                 s.sendall(netstring)
-                logger.debug("[BaresipManager] Sent netstring command: %s", netstring)
+                response = s.recv(4096).decode("utf-8", errors="ignore")  # قراءة الرد
+                logger.info("[BaresipManager] Successfully sent command: %s, response: %s", cmd, response)
         except Exception as exc:
-            logger.exception("[BaresipManager] TCP write failed: %s", exc)
-            
+            logger.error("[BaresipManager] TCP write failed: %s", str(exc))
+            raise
+        
     @staticmethod
     def _parse_user_info(filepath: str) -> tuple[str, str]:
         """Parse SIP_USERNAME and SIP_PASSWORD from user_info file."""
@@ -772,12 +817,35 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
             return False
         return True
 
+
+    def find_element(text_label: str) -> bool:
+        coords = wait_for_element(device_id, text_label, timeout=8.0, max_attempts=80)
+        if not coords:
+            return False
+        return True
+
+    def is_keyboard_open(device_id: str) -> bool:
+        """Check if the soft keyboard is open using dumpsys input_method."""
+        trace_logger = logger.bind(call_trace=True, call_id=device_id)
+        proc = run([ADB, "-s", device_id, "shell", "dumpsys", "input_method"])
+        if proc.returncode != 0:
+            trace_logger.info(f"[is_keyboard_open] dumpsys error => {proc.stderr}")
+            return False
+        return "mInputShown=true" in proc.stdout
+
+    trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
+    if find_element("Attach media"):
+        if is_keyboard_open(device_id):
+            run([ADB, "-s", device_id, "shell", "input", "keyevent", "4"])
+
     trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
     if not find_and_tap("Call"):
         return False
     trace_logger.info("[make_telegram_call] Step: 'End Call' button")
     if not find_and_tap("End Call"):
         return False
+    
+
     trace_logger.info("[make_telegram_call] Step: SECOND 'Call' button")
     if not find_and_tap("Call"):
         return False
