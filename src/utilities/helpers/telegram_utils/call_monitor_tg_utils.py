@@ -10,6 +10,7 @@ Monitors Telegram calls by reading ADB logcat for specific tags and detecting ca
     - DISCONNECTED
 Also integrates with SipManager to answer or disconnect SIP calls accordingly.
 Added feature: Print colored messages in the console using ANSI color codes for better state visibility.
+Enhanced with additional logging for debugging missing state transitions.
 """
 
 import subprocess
@@ -64,13 +65,16 @@ TAGS = [
     "ActivityTaskManager:I",
     "webrtc_voice_engine:I", "webrtc_voice_engine:D",
     "EncryptedConnection:I", "EncryptedConnection:D",
-    "ReflectorPort:I", "ReflectorPort:D", "ReflectorPort:W"
+    "ReflectorPort:I", "ReflectorPort:D", "ReflectorPort:W",
+    # Added for broader coverage
+    "Telecom:V", "ActivityManager:I", "ActivityManager:D"
 ]
 
 PATTERNS = {
     "RINGING": re.compile(
-        r"(START\s+u0\s+\{act=voip.*cmp=org\.telegram\.messenger/org\.telegram\.ui\.LaunchActivity\}|"
-        r"tgvoip.*(Initiating call|Call ringing|set network type:.*active interface))",
+        r"(START\s+u0\s+\{act=voip.*cmp=org\.telegram\.messenger/.*|"
+        r"tgvoip.*(Initiating call|Call ringing|set network type:.*active interface)|"
+        r"Telecom.*(INCOMING_CALL|CALL_RINGING))",
         re.IGNORECASE
     ),
     "CONNECTING": re.compile(
@@ -80,7 +84,8 @@ PATTERNS = {
         r"tgvoip.*(Connecting|Starting connection|Bound to local UDP port|Receive thread starting|Sending UDP ping)|"
         r"webrtc_voice_engine.*(AddSendStream|AddRecvStream|SetSenderParameters|SetReceiverParameters)|"
         r"EncryptedConnection.*(SEND:empty|processSignalingData)|"
-        r"ReflectorPort.*(sending ping))",
+        r"ReflectorPort.*(sending ping)|"
+        r"ActivityManager.*(Starting activity: Intent.*org\.telegram\.messenger))",
         re.IGNORECASE
     ),
     "ANSWERED": re.compile(
@@ -119,12 +124,21 @@ def start_logcat(emulator_port=None, call_id=None):
     adb_cmd = ["adb"]
     if emulator_port:
         adb_cmd += ["-s", f"emulator-{emulator_port}"]
-    subprocess.run(adb_cmd + ["logcat", "-c"], check=True)
+    try:
+        subprocess.run(adb_cmd + ["logcat", "-c"], check=True, capture_output=True, text=True)
+        trace_logger.info("[start_logcat] Logcat buffers cleared successfully")
+    except subprocess.CalledProcessError as e:
+        trace_logger.error(f"[start_logcat] Failed to clear logcat buffers: {e.stderr}")
 
-    trace_logger.info("[start_logcat] Starting new logcat process.")
+    trace_logger.info("[start_logcat] Starting new logcat process with tags: %s", TAGS)
     cmd = adb_cmd + ["logcat", "-v", "time", "-s"] + TAGS
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
-    return proc, call_id_to_use
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        trace_logger.info("[start_logcat] Logcat process started with PID %s", proc.pid)
+        return proc, call_id_to_use
+    except Exception as e:
+        trace_logger.error(f"[start_logcat] Failed to start logcat: {str(e)}")
+        raise
 
 def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                      last_incall_log_time: float, call_id: str):
@@ -144,6 +158,9 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_last_incall_log_time = last_incall_log_time
 
+    # Log raw line for debugging
+    trace_logger.debug(f"[call_monitor] Raw logcat line: {line.strip()}")
+
     # Check if in ANSWERED state to log "in call" status every ~5 seconds
     if new_state == CallState.ANSWERED and start_time is not None:
         if (now_ts - last_incall_log_time) >= 5.0:
@@ -156,6 +173,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
     # Check for state transitions: RINGING, CONNECTING, ANSWERED, DISCONNECTED
     for pattern_state, regex in PATTERNS.items():
         if regex.search(line):
+            trace_logger.info(f"[call_monitor] Matched pattern for {pattern_state}: {line.strip()}")
             # RINGING
             if pattern_state == "RINGING" and new_state == CallState.IDLE:
                 new_state = CallState.RINGING
@@ -228,11 +246,14 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
             "encryptedconnection",
             "reflectorport",
             "audioflinger",
-            "audiomanager"
+            "audiomanager",
+            "telecom",
+            "voipservice",
+            "activitymanager"
         ]
         if any(k in line.lower() for k in relevant_keywords):
             if "createTrack_l(): mismatch" not in line:
-                trace_logger.info(f"[call_monitor] DEBUG unmatched line: {line.strip()}")
+                trace_logger.debug(f"[call_monitor] Unmatched line with relevant keywords: {line.strip()}")
 
     # Handle timeout after 30 seconds in RINGING/CONNECTING
     if new_state in (CallState.RINGING, CallState.CONNECTING) and start_time and (now_ts - start_time) > 30.0:
@@ -271,9 +292,11 @@ def monitor_telegram_calls(
     and logs "in call" duration every ~5s when in ANSWERED state.
     Additionally, colored console output is provided for easier visual tracking.
     """
+    trace_logger = logger.bind(call_trace=True, call_id=call_id or f"monitor-{emulator_port}")
+    trace_logger.info("[monitor_telegram_calls] Starting call monitoring for emulator_port=%s, call_id=%s", emulator_port, call_id)
+
     proc, used_call_id = start_logcat(emulator_port, call_id=call_id)
 
-    trace_logger = logger.bind(call_trace=True, call_id=used_call_id)
     if not output_file:
         ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = f"tg_voip_raw_{ts_str}.log"
@@ -300,8 +323,13 @@ def monitor_telegram_calls(
                 )
     except KeyboardInterrupt:
         trace_logger.info("[monitor_telegram_calls] KeyboardInterrupt => stopping logcat.")
+    except Exception as e:
+        trace_logger.error(f"[monitor_telegram_calls] Error in logcat processing: {str(e)}")
     finally:
         proc.terminate()
-        proc.wait()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         trace_logger.info(f"[monitor_telegram_calls] STOP => saved logs to {output_file}")
         print(colorize("IDLE", f"[monitor_telegram_calls] STOP => saved logs to {output_file}"))
