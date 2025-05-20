@@ -377,7 +377,7 @@ class BaresipManager:
                 description="Incoming call detected"
             )
             try:
-                self._send_cmd('{"command":"answer","params":{}}')
+                self._send_cmd('{"command":"a","params":{}}')
                 logger.info("[BaresipManager] Auto-answered incoming call")
                 log_state(
                     state_code="SIP_CALL_ANSWERED",
