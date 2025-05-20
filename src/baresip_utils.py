@@ -112,10 +112,13 @@ class BaresipManager:
     def wait_incoming_call_end(self) -> bool:
         """Wait for incoming call to end."""
         while self.running and self.current_call_id is None:
+            logger.info(f"check call id is None : {self.running and self.current_call_id is None}")
             time.sleep(0.5)
         if not self.running:
+            logger.info(f"not running")
             return False
         while self.running and self.current_call_id is not None:
+            logger.info(f"check call id is not None : {self.running and self.current_call_id is not None}")
             time.sleep(0.5)
         return True
 
