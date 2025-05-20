@@ -179,26 +179,17 @@ class BaresipManager:
                 stderr=subprocess.PIPE,
                 text=True,
                 env=env,
-                bufsize=1,  # Line buffering
-                universal_newlines=True  # Ensure text mode
+                bufsize=1,
+                universal_newlines=True
             )
             logger.info("[BaresipManager] Started PID %s", self.proc.pid)
             
-            # قراءة أولية للتحقق من الإخراج
-            for _ in range(50):  # 5 ثوانٍ
-                if self.proc.poll() is not None:
-                    stderr_output = self.proc.stderr.read() if self.proc.stderr else "No stderr"
-                    logger.error("[BaresipManager] Baresip terminated early: %s", stderr_output)
-                    raise RuntimeError("Baresip process failed to start")
-                if self.proc.stdout:
-                    line = self.proc.stdout.readline().rstrip()
-                    if line:
-                        logger.info("[BaresipManager] Initial output: %s", line)
-                if self.proc.stderr:
-                    err_line = self.proc.stderr.readline().rstrip()
-                    if err_line:
-                        logger.error("[BaresipManager] Initial error: %s", err_line)
-                time.sleep(0.1)
+            # التحقق من حالة العملية
+            time.sleep(1)
+            if self.proc.poll() is not None:
+                stderr_output = self.proc.stderr.read() if self.proc.stderr else "No stderr"
+                logger.error("[BaresipManager] Baresip terminated early: %s", stderr_output)
+                raise RuntimeError("Baresip process failed to start")
         except Exception as e:
             logger.error("[BaresipManager] Failed to start baresip: %s", str(e))
             raise
@@ -229,11 +220,11 @@ class BaresipManager:
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
             raise RuntimeError("ctrl_tcp not available for baresip")
-        
+
     def _stdout_reader(self) -> None:
         assert self.proc and self.proc.stdout
         try:
-            logger.info("[BaresipManager] Starting stdout reader")
+            logger.info("[BaresipManager] Starting stdout reader thread")
             while self.running:
                 line = self.proc.stdout.readline().rstrip()
                 if not line:
@@ -251,8 +242,6 @@ class BaresipManager:
             logger.error("[BaresipManager] Error in stdout_reader: %s", str(e))
             self.running = False
             
-
-
 
     def _parse_event(self, line: str) -> None:
         logger.debug("[BaresipManager] Parsing event: %s", line)
@@ -331,15 +320,15 @@ class BaresipManager:
             netstring = f"{len(cmd_bytes)}:{cmd},".encode("utf-8")
             logger.debug("[BaresipManager] Sending netstring command: %s", netstring)
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(5)  # زيادة المهلة إلى 5 ثوانٍ
+                s.settimeout(5)  # مهلة 5 ثوانٍ
                 s.connect((host, port))
                 s.sendall(netstring)
-                response = s.recv(4096).decode()  # محاولة قراءة الرد
+                response = s.recv(4096).decode("utf-8", errors="ignore")  # قراءة الرد
                 logger.info("[BaresipManager] Successfully sent command: %s, response: %s", cmd, response)
         except Exception as exc:
             logger.error("[BaresipManager] TCP write failed: %s", str(exc))
             raise
-
+        
     @staticmethod
     def _parse_user_info(filepath: str) -> tuple[str, str]:
         """Parse SIP_USERNAME and SIP_PASSWORD from user_info file."""
