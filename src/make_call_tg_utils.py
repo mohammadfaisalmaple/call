@@ -259,9 +259,15 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
         return True
 
 
+    def find_element(text_label: str) -> bool:
+        coords = wait_for_element(device_id, text_label, timeout=8.0, max_attempts=80)
+        if not coords:
+            return False
+        return True
+
 
     trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
-    if find_and_tap("Attach media"):
+    if find_element("Attach media"):
         run([ADB, "-s", device_id, "shell", "input", "keyevent", "4"])
 
     trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
