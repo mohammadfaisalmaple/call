@@ -270,6 +270,8 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
 
     # Monitor calls using BaresipManager
     trace_logger.info("[make_telegram_call] Monitoring Telegram call logs")
+    trace_logger.info("monitor_telegram_calls monitor_telegram_calls ")
+
     monitor_telegram_calls(sip_manager, emulator_port=emulator_port, output_file=None)
 
     sip_manager.ensure_connected()
