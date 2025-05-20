@@ -17,7 +17,7 @@ def main():
     sip_manager = BaresipManager(node_id="node1", user_id="user1", instance_id="inst1")
     try:
         result = make_telegram_call(
-            adb_port="emulator-5556",
+            adb_port="emulator-5554",
             phone="+962788542246",
             contact_name="Test Contact",
             sip_manager=sip_manager,
