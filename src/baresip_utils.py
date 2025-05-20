@@ -113,17 +113,18 @@ class BaresipManager:
         """Hang up current call."""
         self._send_cmd("hangup")
 
-    def wait_incoming_call_end(self) -> bool:
-        """Wait for incoming call to end."""
-        while self.running and self.current_call_id is None:
-            logger.info(f"check call id is None : {self.running and self.current_call_id is None}")
+    def wait_incoming_call_end(self, timeout: float = 30.0) -> bool:
+        start_time = time.time()
+        call_detected = False
+        while self.running and (time.time() - start_time) < timeout:
+            logger.info(f"[BaresipManager] Waiting for call events, elapsed: {time.time() - start_time:.2f}s")
             time.sleep(0.5)
         if not self.running:
-            logger.info(f"not running")
+            logger.info("[BaresipManager] Stopped running")
             return False
-        while self.running and self.current_call_id is not None:
-            logger.info(f"check call id is not None : {self.running and self.current_call_id is not None}")
-            time.sleep(0.5)
+        if time.time() - start_time >= timeout:
+            logger.error("[BaresipManager] Timeout waiting for call events")
+            return False
         return True
 
     def _details(self) -> dict:
@@ -234,8 +235,7 @@ class BaresipManager:
             logger.error("[BaresipManager] Error in stdout_reader: %s", str(e))
             
     def _parse_event(self, line: str) -> None:
-        """Parse Baresip output events."""
-        logger.debug("***** [_parse_event] ***")  # تسجيل كل سطر خام
+        logger.debug("[BaresipManager] Parsing event: %s", line)
         lower = line.lower()
         if "registered" in lower and "ua" in lower:
             self.registered = True
@@ -243,41 +243,47 @@ class BaresipManager:
                 state_code="SIP_REGISTRATION_OK", operation="call_mode", action="register_sip_account",
                 status="success", details=self._details(), description="Account registered with Asterisk"
             )
-        elif "incoming" in lower and "call" in lower:
-            parts = line.split()
-            self.current_call_id = parts[1] if len(parts) > 1 else "unknown"
+        elif "incoming call from" in lower and "sip:" in lower:  # اكتشاف مكالمة واردة
             log_state(
                 state_code="SIP_CALL_INCOMING", operation="call_mode", action="incoming_detect",
                 status="initiated", details=self._details(), description="incoming call detected"
             )
-            # Auto-answer the incoming call
-            self.answer_call()
+            # قبول المكالمة تلقائيًا دون call_id
+            self._send_cmd('{"command":"answer","params":{}}')
+            logger.info("[BaresipManager] Auto-answered incoming call")
+            log_state(
+                state_code="SIP_CALL_ANSWERED", operation="call_mode", action="answer_call",
+                status="success", details=self._details(), description="call answered via baresip"
+            )
         elif "answered" in lower:
             log_state(
                 state_code="SIP_CALL_CONFIRMED", operation="call_mode", action="call_confirmed",
                 status="success", details=self._details(), description="call answered/confirmed"
             )
         elif "closed" in lower and "call" in lower:
-            self.current_call_id = None
             log_state(
                 state_code="SIP_CALL_DISCONNECTED", operation="call_mode", action="call_closed",
                 status="success", details=self._details(), description="call closed"
             )
 
+
     def _send_cmd(self, cmd: str) -> None:
-        """Send command to Baresip via TCP socket."""
         if not self.cmd_fifo or not self.cmd_fifo.startswith("tcp:"):
             logger.error("[BaresipManager] ctrl_tcp not ready")
             return
         try:
             host, port = self.cmd_fifo.replace("tcp:", "").split(":")
             port = int(port)
+            # تنسيق netstring: <length>:<command>,
+            cmd_bytes = cmd.encode("utf-8")
+            netstring = f"{len(cmd_bytes)}:{cmd},".encode("utf-8")
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect((host, port))
-                s.sendall((cmd + "\n").encode("utf-8"))
+                s.sendall(netstring)
+                logger.debug("[BaresipManager] Sent netstring command: %s", netstring)
         except Exception as exc:
             logger.exception("[BaresipManager] TCP write failed: %s", exc)
-
+            
     @staticmethod
     def _parse_user_info(filepath: str) -> tuple[str, str]:
         """Parse SIP_USERNAME and SIP_PASSWORD from user_info file."""
