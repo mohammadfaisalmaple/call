@@ -251,38 +251,69 @@ class BaresipManager:
             logger.error("[BaresipManager] Error in stdout_reader: %s", str(e))
             self.running = False
             
+
     def _parse_event(self, line: str) -> None:
         logger.debug("[BaresipManager] Parsing event: %s", line)
-        lower = line.lower()
+        lower = line.lower().strip()  # إزالة المسافات البيضاء
         if "registered" in lower and "ua" in lower:
             self.registered = True
             log_state(
-                state_code="SIP_REGISTRATION_OK", operation="call_mode", action="register_sip_account",
-                status="success", details=self._details(), description="Account registered with Asterisk"
+                state_code="SIP_REGISTRATION_OK",
+                operation="call_mode",
+                action="register_sip_account",
+                status="success",
+                details=self._details(),
+                description="Account registered with Asterisk"
             )
-        elif "incoming call from" in lower and "sip:" in lower:  # اكتشاف مكالمة واردة
+        elif "incoming call from" in lower or "call from" in lower:
+            logger.info("[BaresipManager] Detected incoming call: %s", line)
             log_state(
-                state_code="SIP_CALL_INCOMING", operation="call_mode", action="incoming_detect",
-                status="initiated", details=self._details(), description="incoming call detected"
+                state_code="SIP_CALL_INCOMING",
+                operation="call_mode",
+                action="incoming_detect",
+                status="initiated",
+                details=self._details(),
+                description="incoming call detected"
             )
-            # قبول المكالمة تلقائيًا دون call_id
-            self._send_cmd('{"command":"answer","params":{}}')
-            logger.info("[BaresipManager] Auto-answered incoming call")
-            log_state(
-                state_code="SIP_CALL_ANSWERED", operation="call_mode", action="answer_call",
-                status="success", details=self._details(), description="call answered via baresip"
-            )
+            try:
+                self._send_cmd('{"command":"answer","params":{}}')
+                logger.info("[BaresipManager] Auto-answered incoming call")
+                log_state(
+                    state_code="SIP_CALL_ANSWERED",
+                    operation="call_mode",
+                    action="answer_call",
+                    status="success",
+                    details=self._details(),
+                    description="call answered via baresip"
+                )
+            except Exception as e:
+                logger.error("[BaresipManager] Failed to send answer command: %s", str(e))
+                log_state(
+                    state_code="SIP_CALL_ANSWER_FAILED",
+                    operation="call_mode",
+                    action="answer_call",
+                    status="failed",
+                    details=self._details(),
+                    description=f"Failed to answer call: {str(e)}"
+                )
         elif "answered" in lower:
             log_state(
-                state_code="SIP_CALL_CONFIRMED", operation="call_mode", action="call_confirmed",
-                status="success", details=self._details(), description="call answered/confirmed"
+                state_code="SIP_CALL_CONFIRMED",
+                operation="call_mode",
+                action="call_confirmed",
+                status="success",
+                details=self._details(),
+                description="call answered/confirmed"
             )
         elif "closed" in lower and "call" in lower:
             log_state(
-                state_code="SIP_CALL_DISCONNECTED", operation="call_mode", action="call_closed",
-                status="success", details=self._details(), description="call closed"
+                state_code="SIP_CALL_DISCONNECTED",
+                operation="call_mode",
+                action="call_closed",
+                status="success",
+                details=self._details(),
+                description="call closed"
             )
-
 
     def _send_cmd(self, cmd: str) -> None:
         if not self.cmd_fifo or not self.cmd_fifo.startswith("tcp:"):
@@ -291,16 +322,18 @@ class BaresipManager:
         try:
             host, port = self.cmd_fifo.replace("tcp:", "").split(":")
             port = int(port)
-            # تنسيق netstring: <length>:<command>,
             cmd_bytes = cmd.encode("utf-8")
             netstring = f"{len(cmd_bytes)}:{cmd},".encode("utf-8")
+            logger.debug("[BaresipManager] Sending netstring command: %s", netstring)
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2)  # زيادة المهلة إلى ثانيتين
                 s.connect((host, port))
                 s.sendall(netstring)
-                logger.debug("[BaresipManager] Sent netstring command: %s", netstring)
+                logger.info("[BaresipManager] Successfully sent command: %s", cmd)
         except Exception as exc:
-            logger.exception("[BaresipManager] TCP write failed: %s", exc)
-            
+            logger.error("[BaresipManager] TCP write failed: %s", str(exc))
+            raise
+
     @staticmethod
     def _parse_user_info(filepath: str) -> tuple[str, str]:
         """Parse SIP_USERNAME and SIP_PASSWORD from user_info file."""
