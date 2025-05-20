@@ -204,7 +204,7 @@ class BaresipManager:
             raise
 
         # التحقق من واجهة ctrl_tcp
-        for _ in 1000:  # 100 ثانية للتأكد من الاتصال
+        for _ in range(100):  # 10 ثوانٍ
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(1)
@@ -220,7 +220,7 @@ class BaresipManager:
                 if 's' in locals():
                     s.close()
         else:
-            stderr_output = self.proc.stderr.read() if self himselfelf.proc.stderr else "No stderr"
+            stderr_output = self.proc.stderr.read() if self.proc.stderr else "No stderr"
             logger.error("[BaresipManager] Failed to connect to ctrl_tcp: %s", stderr_output)
             if self.proc:
                 self.proc.terminate()
@@ -229,18 +229,20 @@ class BaresipManager:
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
             raise RuntimeError("ctrl_tcp not available for baresip")
-
+        
     def _stdout_reader(self) -> None:
         assert self.proc and self.proc.stdout
         try:
+            logger.info("[BaresipManager] Starting stdout reader")
             while self.running:
                 line = self.proc.stdout.readline().rstrip()
                 if not line:
-                    if self.proc.poll() is not None:  # التحقق من توقف العملية
+                    if self.proc.poll() is not None:
                         stderr_output = self.proc.stderr.read() if self.proc.stderr else "No stderr"
                         logger.error("[BaresipManager] Baresip process terminated: %s", stderr_output)
                         self.running = False
                         break
+                    logger.debug("[BaresipManager] Empty line received, continuing...")
                     time.sleep(0.01)
                     continue
                 logger.debug("[baresip] RAW OUTPUT: %s", line)
