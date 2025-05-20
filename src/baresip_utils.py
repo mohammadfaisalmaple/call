@@ -165,7 +165,6 @@ class BaresipManager:
 
     
      
-
     def _spawn_process(self) -> None:
         """Spawn Baresip subprocess."""
         env = os.environ.copy()
@@ -173,13 +172,39 @@ class BaresipManager:
         env["LD_LIBRARY_PATH"] = "/usr/local/lib/baresip/modules:" + env.get("LD_LIBRARY_PATH", "")
         cmd = [self.baresip_bin, "-f", str(self.cfg_dir), "-m", "ctrl_tcp"]
         logger.info("[BaresipManager] Starting baresip with command: %s", cmd)
-        self.proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
-        )
-        logger.info("[BaresipManager] Started PID %s", self.proc.pid)
-        
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                bufsize=1,  # Line buffering
+                universal_newlines=True  # Ensure text mode
+            )
+            logger.info("[BaresipManager] Started PID %s", self.proc.pid)
+            
+            # قراءة أولية للتحقق من الإخراج
+            for _ in range(50):  # 5 ثوانٍ
+                if self.proc.poll() is not None:
+                    stderr_output = self.proc.stderr.read() if self.proc.stderr else "No stderr"
+                    logger.error("[BaresipManager] Baresip terminated early: %s", stderr_output)
+                    raise RuntimeError("Baresip process failed to start")
+                if self.proc.stdout:
+                    line = self.proc.stdout.readline().rstrip()
+                    if line:
+                        logger.info("[BaresipManager] Initial output: %s", line)
+                if self.proc.stderr:
+                    err_line = self.proc.stderr.readline().rstrip()
+                    if err_line:
+                        logger.error("[BaresipManager] Initial error: %s", err_line)
+                time.sleep(0.1)
+        except Exception as e:
+            logger.error("[BaresipManager] Failed to start baresip: %s", str(e))
+            raise
+
         # التحقق من واجهة ctrl_tcp
-        for _ in range(100):  # 10 ثوانٍ
+        for _ in 1000:  # 100 ثانية للتأكد من الاتصال
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(1)
@@ -192,9 +217,11 @@ class BaresipManager:
                 logger.debug("[BaresipManager] ctrl_tcp not yet available: %s", str(e))
                 time.sleep(0.1)
             finally:
-                s.close()
+                if 's' in locals():
+                    s.close()
         else:
-            logger.error("[BaresipManager] Failed to connect to ctrl_tcp after retries")
+            stderr_output = self.proc.stderr.read() if self himselfelf.proc.stderr else "No stderr"
+            logger.error("[BaresipManager] Failed to connect to ctrl_tcp: %s", stderr_output)
             if self.proc:
                 self.proc.terminate()
                 try:
@@ -202,37 +229,25 @@ class BaresipManager:
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
             raise RuntimeError("ctrl_tcp not available for baresip")
-        
-        # قراءة إخراج baresip للتحقق من التسجيل
-        output = ""
-        for _ in range(300):  # قراءة لمدة 30 ثانية
-            line = self.proc.stdout.readline() if self.proc.stdout else ""
-            if not line:
-                break
-            output += line
-            if "useragent registered successfully" in line.lower():
-                logger.info("[BaresipManager] SIP registration successful: %s", line.strip())
-                self.registered = True
-            elif "connection timed out" in line.lower():
-                logger.error("[BaresipManager] SIP registration failed: %s", line.strip())
-            elif "ctrl_tcp" in line.lower():
-                logger.error("[BaresipManager] ctrl_tcp error: %s", line.strip())
-        logger.debug("[BaresipManager] baresip initial output: %s", output)
 
     def _stdout_reader(self) -> None:
         assert self.proc and self.proc.stdout
         try:
-            for line in self.proc.stdout:
-                line = line.rstrip()
+            while self.running:
+                line = self.proc.stdout.readline().rstrip()
                 if not line:
+                    if self.proc.poll() is not None:  # التحقق من توقف العملية
+                        stderr_output = self.proc.stderr.read() if self.proc.stderr else "No stderr"
+                        logger.error("[BaresipManager] Baresip process terminated: %s", stderr_output)
+                        self.running = False
+                        break
+                    time.sleep(0.01)
                     continue
                 logger.debug("[baresip] RAW OUTPUT: %s", line)
                 self._parse_event(line)
-                if not self.running:
-                    break
-                time.sleep(0.1)
         except Exception as e:
             logger.error("[BaresipManager] Error in stdout_reader: %s", str(e))
+            self.running = False
             
     def _parse_event(self, line: str) -> None:
         logger.debug("[BaresipManager] Parsing event: %s", line)
