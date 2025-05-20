@@ -9,7 +9,7 @@ Monitors Telegram calls by reading ADB logcat for specific tags and detecting ca
     - ANSWERED
     - DISCONNECTED
 Integrates with SipManager to answer or disconnect SIP calls.
-Uses precise patterns from telegram_call_sniffer.py for reliable state detection.
+Logs states clearly as [CALL_STATE] RINGING, etc., in both console and log file.
 Enhanced with debugging to identify missing state transitions.
 """
 
@@ -103,6 +103,18 @@ PATTERNS = {
     )
 }
 
+def write_state_to_log(file, state: str, timestamp: str, duration: float = None, event: str = None):
+    """
+    Write call state to the log file in a clear format.
+    """
+    state_line = f"[{timestamp}] [CALL_STATE] {state}"
+    if duration is not None:
+        state_line += f" (Duration: {duration:.1f}s)"
+    if event:
+        state_line += f" | {event}"
+    file.write(f"{state_line}\n")
+    file.flush()
+
 def start_logcat(emulator_port=None, call_id=None):
     """
     Starts a filtered ADB logcat process for certain tags.
@@ -142,6 +154,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                      last_incall_log_time: float, call_id: str):
     """
     Parses each log line to detect call state transitions.
+    Logs states clearly as [CALL_STATE] RINGING, etc., in console and log file.
     Returns (new_state, new_start_time, new_last_incall_log_time).
     """
     trace_logger = logger.bind(call_trace=True, call_id=call_id)
@@ -156,7 +169,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
     if new_state == CallState.ANSWERED and start_time is not None:
         if (now_ts - last_incall_log_time) >= 5.0:
             in_call_sec = int(now_ts - start_time)
-            msg = f"[call_monitor] IN CALL => {in_call_sec} seconds so far."
+            msg = f"[{now_str}] [CALL_STATE] IN_CALL (Duration: {in_call_sec}s)"
             trace_logger.info(msg)
             print(colorize("ANSWERED", msg))
             new_last_incall_log_time = now_ts
@@ -171,7 +184,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
             if pattern_state == "RINGING" and new_state == CallState.IDLE:
                 new_state = CallState.RINGING
                 start_time = now_ts
-                msg = f"[call_monitor] RINGING at {now_str} | {event}"
+                msg = f"[{now_str}] [CALL_STATE] RINGING | {event}"
                 trace_logger.info(msg)
                 print(colorize("RINGING", msg))
 
@@ -180,7 +193,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                 new_state = CallState.CONNECTING
                 if not start_time:
                     start_time = now_ts
-                msg = f"[call_monitor] CONNECTING at {now_str} | {event}"
+                msg = f"[{now_str}] [CALL_STATE] CONNECTING | {event}"
                 trace_logger.info(msg)
                 print(colorize("CONNECTING", msg))
 
@@ -188,7 +201,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
             elif pattern_state == "ANSWERED" and new_state in (CallState.RINGING, CallState.CONNECTING):
                 new_state = CallState.ANSWERED
                 duration = (now_ts - start_time) if start_time else 0
-                msg = f"[call_monitor] ANSWERED at {now_str} | {event} | Connected after {duration:.1f}s"
+                msg = f"[{now_str}] [CALL_STATE] ANSWERED | {event} (Duration: {duration:.1f}s)"
                 trace_logger.info(msg)
                 print(colorize("ANSWERED", msg))
 
@@ -212,7 +225,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                 new_state = CallState.DISCONNECTED
                 duration = (now_ts - start_time) if start_time else 0
                 reason_str = "Rejected" if old_state != CallState.ANSWERED else "Ended"
-                msg = f"[call_monitor] DISCONNECTED at {now_str} | {event} | {reason_str} after {duration:.1f}s"
+                msg = f"[{now_str}] [CALL_STATE] DISCONNECTED | {event} ({reason_str}, Duration: {duration:.1f}s)"
                 trace_logger.info(msg)
                 print(colorize("DISCONNECTED", msg))
 
@@ -248,10 +261,11 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
     # Debug prolonged CONNECTING state
     if new_state == CallState.CONNECTING and start_time and (now_ts - start_time) > 10.0:
         trace_logger.debug(f"[call_monitor] Still in CONNECTING after {(now_ts - start_time):.1f}s")
+        print(colorize("DEBUG", f"[{now_str}] [CALL_STATE] CONNECTING (Still active, Duration: {(now_ts - start_time):.1f}s)"))
 
     # Handle timeout after 30 seconds in RINGING/CONNECTING
     if new_state in (CallState.RINGING, CallState.CONNECTING) and start_time and (now_ts - start_time) > 30.0:
-        msg = f"[call_monitor] TIMEOUT after 30s at {now_str} => disconnect"
+        msg = f"[{now_str}] [CALL_STATE] DISCONNECTED | Timeout after 30s"
         trace_logger.info(msg)
         print(colorize("DISCONNECTED", msg))
         step_ok = execute_step(
@@ -280,7 +294,7 @@ def monitor_telegram_calls(
 ):
     """
     Monitors Telegram calls by reading ADB logcat for certain tags.
-    Displays state transitions and logs "in call" duration every ~5s when in ANSWERED state.
+    Logs state transitions clearly as [CALL_STATE] RINGING, etc., in console and log file.
     """
     trace_logger = logger.bind(call_trace=True, call_id=call_id or f"monitor-{emulator_port}")
     trace_logger.info("[monitor_telegram_calls] Starting call monitoring for emulator_port=%s, call_id=%s", emulator_port, call_id)
@@ -291,10 +305,18 @@ def monitor_telegram_calls(
         adb_cmd += ["-s", f"emulator-{emulator_port}"]
     try:
         result = subprocess.run(adb_cmd + ["shell", "getprop ro.boot.emulator"], capture_output=True, text=True, timeout=5)
-        trace_logger.info("[monitor_telegram_calls] Emulator check: %s", result.stdout.strip())
+        trace_logger.info("[monitor_telegram_calls] Emulator check: %s", result.stdout.strip() or "No output")
     except subprocess.SubprocessError as e:
         trace_logger.error(f"[monitor_telegram_calls] Emulator check failed: {str(e)}")
         return
+
+    # Check if Telegram is in foreground
+    try:
+        result = subprocess.run(adb_cmd + ["shell", "dumpsys activity | grep mResumedActivity"], capture_output=True, text=True, timeout=5)
+        is_foreground = "org.telegram.messenger" in result.stdout
+        trace_logger.info("[monitor_telegram_calls] Telegram in foreground: %s", is_foreground)
+    except subprocess.SubprocessError as e:
+        trace_logger.error(f"[monitor_telegram_calls] Telegram foreground check failed: {str(e)}")
 
     proc, used_call_id = start_logcat(emulator_port, call_id=call_id)
 
@@ -303,6 +325,7 @@ def monitor_telegram_calls(
         output_file = f"tg_voip_raw_{ts_str}.log"
 
     trace_logger.info(f"[monitor_telegram_calls] START, logging to {output_file}")
+    print(colorize("IDLE", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [CALL_STATE] START | Logging to {output_file}"))
 
     current_state = CallState.IDLE
     call_start_time = None
@@ -313,7 +336,7 @@ def monitor_telegram_calls(
         with open(output_file, "w", encoding="utf-8") as f:
             for line in proc.stdout:
                 f.write(line)
-                f.flush()
+                write_state_to_log(f, current_state.value, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), event=line.strip())
                 current_state, call_start_time, last_incall_log_time = process_log_line(
                     line,
                     current_state,
@@ -322,6 +345,7 @@ def monitor_telegram_calls(
                     last_incall_log_time,
                     used_call_id
                 )
+                write_state_to_log(f, current_state.value, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), event=line.strip())
     except KeyboardInterrupt:
         trace_logger.info("[monitor_telegram_calls] KeyboardInterrupt => stopping logcat.")
     except Exception as e:
@@ -333,4 +357,4 @@ def monitor_telegram_calls(
         except subprocess.TimeoutExpired:
             proc.kill()
         trace_logger.info(f"[monitor_telegram_calls] STOP => saved logs to {output_file}")
-        print(colorize("IDLE", f"[monitor_telegram_calls] STOP => saved logs to {output_file}"))
+        print(colorize("IDLE", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [CALL_STATE] STOP | Saved logs to {output_file}"))
