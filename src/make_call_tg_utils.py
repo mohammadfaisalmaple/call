@@ -258,7 +258,12 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
             return False
         return True
 
-    run([ADB, "-s", device_id, "shell", "input", "keyevent", "4"])
+
+
+    trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
+    if find_and_tap("Attach media"):
+        run([ADB, "-s", device_id, "shell", "input", "keyevent", "4"])
+
     trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
     if not find_and_tap("Call"):
         return False
@@ -266,7 +271,7 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
     if not find_and_tap("End Call"):
         return False
     
-    run([ADB, "-s", device_id, "shell", "input", "keyevent", "4"])
+
     trace_logger.info("[make_telegram_call] Step: SECOND 'Call' button")
     if not find_and_tap("Call"):
         return False
