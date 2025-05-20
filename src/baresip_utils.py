@@ -215,21 +215,20 @@ class BaresipManager:
         logger.debug("[BaresipManager] baresip initial output: %s", output)
 
     def _stdout_reader(self) -> None:
-        """Read Baresip stdout and parse events."""
         assert self.proc and self.proc.stdout
         for line in self.proc.stdout:
             line = line.rstrip()
             if not line:
                 continue
-            logger.debug("[baresip] %s", line)
+            logger.debug("[baresip] RAW OUTPUT: %s", line)  # تسجيل كل سطر خام
             self._parse_event(line)
             if not self.running:
                 break
             time.sleep(0.1)
-
-
+            
     def _parse_event(self, line: str) -> None:
         """Parse Baresip output events."""
+        logger.debug("***** [_parse_event] ***")  # تسجيل كل سطر خام
         lower = line.lower()
         if "registered" in lower and "ua" in lower:
             self.registered = True

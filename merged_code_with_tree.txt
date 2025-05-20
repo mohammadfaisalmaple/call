@@ -27,6 +27,28 @@ python-dotenv==1.0.0
 # ===== End of ./requirements.txt =====
 
 
+# ===== File: ./answerCall.py =====
+
+import socket
+import time
+
+HOST = '127.0.0.1'
+PORT = 4444
+
+print("⌛️ انتظار المكالمة ...")
+time.sleep(10)  # امنح وقتًا كافيًا للمكالمة لتصل
+
+print("📞 إرسال أمر الرد عبر TCP ...")
+try:
+    with socket.create_connection((HOST, PORT), timeout=10) as sock:
+        sock.sendall(b'call accept\n')
+        print("✅ تم إرسال أمر الرد.")
+except Exception as e:
+    print("❌ فشل الاتصال بـ baresip:", e)
+
+# ===== End of ./answerCall.py =====
+
+
 # ===== File: ./test.py =====
 
 import socket
@@ -57,14 +79,16 @@ print("Response:", resp)
 
 # ===== File: ./config/.env =====
 
-ADB_PATH=/home/mohammad/Android/Sdk/platform-tools/adb # تأكد من المسار الصحيح لـ adb
+#ADB_PATH=/home/mohammad/Android/Sdk/platform-tools/adb # تأكد من المسار الصحيح لـ adb
+ADB_PATH=/home/user1/Android/Sdk/platform-tools/adb
+
 ASTERISK_HOST=65.21.133.183
 ASTERISK_PORT=5060
 SIP_TRANSPORT_PORT=5060   
-USER_INFO_FILE=/home/mohammad/Documents/mohammadFaisal/telegram_call_project/config/user_info.txt
+USER_INFO_FILE=/home/user1/call/config/user_info.txt
 PULSE_SINK=default
 PULSE_SOURCE=default
-BARESIP_BIN=/usr/local/bin/baresip  # تأكد من المسار الصحيح لـ baresip
+BARESIP_BIN=/usr/bin/baresip  # تأكد من المسار الصحيح لـ baresip
 CALL_UID_FIND_TIMEOUT=2.0
 CALL_UID_FIND_INTERVAL=0.2
 
@@ -183,6 +207,7 @@ class BaresipManager:
         if not self.current_call_id:
             logger.warning("[BaresipManager] No current call to answer")
             return
+        logger.info("[BaresipManager] Sending answer command for call_id=%s", self.current_call_id)
         self._send_cmd("answer")
         log_state(
             state_code="SIP_CALL_ANSWERED", operation="call_mode", action="answer_call",
@@ -196,10 +221,13 @@ class BaresipManager:
     def wait_incoming_call_end(self) -> bool:
         """Wait for incoming call to end."""
         while self.running and self.current_call_id is None:
+            logger.info(f"check call id is None : {self.running and self.current_call_id is None}")
             time.sleep(0.5)
         if not self.running:
+            logger.info(f"not running")
             return False
         while self.running and self.current_call_id is not None:
+            logger.info(f"check call id is not None : {self.running and self.current_call_id is not None}")
             time.sleep(0.5)
         return True
 
@@ -269,6 +297,15 @@ class BaresipManager:
                 time.sleep(0.1)
             finally:
                 s.close()
+        else:
+            logger.error("[BaresipManager] Failed to connect to ctrl_tcp after retries")
+            if self.proc:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+            raise RuntimeError("ctrl_tcp not available for baresip")
         
         # قراءة إخراج baresip للتحقق من التسجيل
         output = ""
@@ -285,21 +322,7 @@ class BaresipManager:
             elif "ctrl_tcp" in line.lower():
                 logger.error("[BaresipManager] ctrl_tcp error: %s", line.strip())
         logger.debug("[BaresipManager] baresip initial output: %s", output)
-        
-        if not self.cmd_fifo:
-            try:
-                logger.error("[BaresipManager] ctrl_tcp not available, baresip output: %s", output)
-            except Exception as e:
-                logger.error("[BaresipManager] Failed to read baresip output: %s", str(e))
-            finally:
-                if self.proc:
-                    self.proc.terminate()
-                    try:
-                        self.proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        self.proc.kill()
-            raise RuntimeError("ctrl_tcp not available for baresip")
-     
+
     def _stdout_reader(self) -> None:
         """Read Baresip stdout and parse events."""
         assert self.proc and self.proc.stdout
@@ -312,6 +335,7 @@ class BaresipManager:
             if not self.running:
                 break
             time.sleep(0.1)
+
 
     def _parse_event(self, line: str) -> None:
         """Parse Baresip output events."""
@@ -329,6 +353,8 @@ class BaresipManager:
                 state_code="SIP_CALL_INCOMING", operation="call_mode", action="incoming_detect",
                 status="initiated", details=self._details(), description="incoming call detected"
             )
+            # Auto-answer the incoming call
+            self.answer_call()
         elif "answered" in lower:
             log_state(
                 state_code="SIP_CALL_CONFIRMED", operation="call_mode", action="call_confirmed",
@@ -404,9 +430,10 @@ from baresip_utils import BaresipManager
 
 def monitor_telegram_calls(sip_manager: BaresipManager, emulator_port: str, output_file: str = None) -> None:
     logger.info(f"[monitor_telegram_calls] Monitoring calls for emulator_port={emulator_port}")
-    if sip_manager.ensure_connected(timeout=20):  # زيادة المهلة إلى 20 ثانية
+    if sip_manager.ensure_connected(timeout=2):
         logger.info("[monitor_telegram_calls] SIP connected, waiting for call events")
         sip_manager.wait_incoming_call_end()
+        logger.info("[monitor_telegram_calls] Call monitoring completed, auto-answer triggered if incoming call detected")
     else:
         logger.error("[monitor_telegram_calls] SIP connection failed, registration status: %s", sip_manager.is_registered())
 # ===== End of ./src/utilities/helpers/telegram_utils/call_monitor_tg_utils.py =====
@@ -773,8 +800,8 @@ def main():
     sip_manager = BaresipManager(node_id="node1", user_id="user1", instance_id="inst1")
     try:
         result = make_telegram_call(
-            adb_port="emulator-5556",
-            phone="+962775054337",
+            adb_port="emulator-5554",
+            phone="+962788542246",
             contact_name="Test Contact",
             sip_manager=sip_manager,
             rabbit_queue_name="call_queue",
@@ -793,8 +820,10 @@ if __name__ == "__main__":
 # ===== Project Tree =====
 
 .
+├── answerCall.py
 ├── config
 │   └── user_info.txt
+├── ctrl_tcp -> /usr/lib/baresip/modules/ctrl_tcp.so
 ├── __init__.py
 ├── merge_codes.sh
 ├── merged_code_with_tree.txt
@@ -823,4 +852,4 @@ if __name__ == "__main__":
 │           └── state_manager.py
 └── test.py
 
-8 directories, 21 files
+8 directories, 23 files

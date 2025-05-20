@@ -106,7 +106,7 @@ def find_element_center(xml_content: str, text: str) -> Optional[Tuple[int, int]
         trace_logger.info(f"[find_element_center] XML parse error => {e}")
     return None
 
-def wait_for_element(device_id: str, text: str, timeout: float = 2.0, max_attempts: int = 40) -> Optional[Tuple[int, int]]:
+def wait_for_element(device_id: str, text: str, timeout: float = 12.0, max_attempts: int = 40) -> Optional[Tuple[int, int]]:
     """Poll UI for element by text or content-desc, return center coords."""
     trace_logger = logger.bind(call_trace=True, call_id=device_id)
     trace_logger.info(f"[wait_for_element] searching '{text}' with timeout={timeout}s")
