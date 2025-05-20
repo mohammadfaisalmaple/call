@@ -8,9 +8,9 @@ Monitors Telegram calls by reading ADB logcat for specific tags and detecting ca
     - CONNECTING
     - ANSWERED
     - DISCONNECTED
-Also integrates with SipManager to answer or disconnect SIP calls accordingly.
-Added feature: Print colored messages in the console using ANSI color codes for better state visibility.
-Enhanced with additional logging for debugging missing state transitions.
+Integrates with SipManager to answer or disconnect SIP calls.
+Uses precise patterns from telegram_call_sniffer.py for reliable state detection.
+Enhanced with debugging to identify missing state transitions.
 """
 
 import subprocess
@@ -39,13 +39,13 @@ COLOR_CODES = {
     "CONNECTING": "\033[93m",   # Yellow
     "ANSWERED": "\033[92m",     # Green
     "DISCONNECTED": "\033[91m", # Red
+    "DEBUG": "\033[90m",        # Gray for debug messages
     "RESET": "\033[0m"          # Reset to default
 }
 
 def colorize(state_str: str, message: str) -> str:
     """
     Wraps a given message in ANSI color codes based on the state name.
-    This helps distinguish different call states on the console.
     """
     color = COLOR_CODES.get(state_str, COLOR_CODES["RESET"])
     return f"{color}{message}{COLOR_CODES['RESET']}"
@@ -54,7 +54,7 @@ TAGS = [
     "tgvoip:V", "tgvoip:D", "tgvoip:I", "tgvoip:W", "tgvoip:E",
     "MediaFocusControl:I", "MediaFocusControl:D",
     "AudioManager:I", "AudioManager:D",
-    "Telecom:I", "Telecom:D",
+    "Telecom:I", "Telecom:D", "Telecom:V",
     "VoIPService:D", "VoIPService:I",
     "VoIPBaseService:D",
     "VoIPController:D",
@@ -62,23 +62,21 @@ TAGS = [
     "ConnectionService:D",
     "AudioService:I",
     "AudioFlinger:D", "AudioFlinger:I",
-    "ActivityTaskManager:I",
+    "ActivityTaskManager:I", "ActivityManager:I", "ActivityManager:D",
     "webrtc_voice_engine:I", "webrtc_voice_engine:D",
     "EncryptedConnection:I", "EncryptedConnection:D",
-    "ReflectorPort:I", "ReflectorPort:D", "ReflectorPort:W",
-    # Added for broader coverage
-    "Telecom:V", "ActivityManager:I", "ActivityManager:D"
+    "ReflectorPort:I", "ReflectorPort:D", "ReflectorPort:W"
 ]
 
 PATTERNS = {
     "RINGING": re.compile(
-        r"(START\s+u0\s+\{act=voip.*cmp=org\.telegram\.messenger/.*|"
+        r"(?P<event>START\s+u0\s+\{act=voip.*cmp=org\.telegram\.messenger/.*|"
         r"tgvoip.*(Initiating call|Call ringing|set network type:.*active interface)|"
         r"Telecom.*(INCOMING_CALL|CALL_RINGING))",
         re.IGNORECASE
     ),
     "CONNECTING": re.compile(
-        r"(requestAudioFocus.*USAGE_VOICE_COMMUNICATION|"
+        r"(?P<event>requestAudioFocus.*USAGE_VOICE_COMMUNICATION|"
         r"VoIPService.*startOutgoingCall|"
         r"Telecom.*NEW_OUTGOING_CALL|"
         r"tgvoip.*(Connecting|Starting connection|Bound to local UDP port|Receive thread starting|Sending UDP ping)|"
@@ -89,14 +87,14 @@ PATTERNS = {
         re.IGNORECASE
     ),
     "ANSWERED": re.compile(
-        r"(tgvoip.*(First audio packet - setting state to ESTABLISHED|Call state changed to 3|Call established|Call connected)|"
+        r"(?P<event>tgvoip.*(First audio packet - setting state to ESTABLISHED|Call state changed to 3|Call established|Call connected)|"
         r"AudioFlinger.*(thread.*ready to run|Track created successfully|start output|audio stream started)|"
         r"AudioManager.*MODE_IN_COMMUNICATION|"
         r"MediaFocusControl.*AUDIOFOCUS_GAIN)",
         re.IGNORECASE
     ),
     "DISCONNECTED": re.compile(
-        r"(abandonAudioFocus|"
+        r"(?P<event>abandonAudioFocus|"
         r"tgvoip.*(Call ended|Call rejected|Call terminated)|"
         r"Telecom.*(CALL_DISCONNECTED|CALL_REJECTED)|"
         r"MediaFocusControl.*AUDIOFOCUS_LOSS|"
@@ -108,7 +106,6 @@ PATTERNS = {
 def start_logcat(emulator_port=None, call_id=None):
     """
     Starts a filtered ADB logcat process for certain tags.
-    If call_id is given, it is used. Otherwise default to 'monitor-{emulator_port}'.
     Returns:
         - proc: The subprocess.Popen object for the logcat process
         - call_id_to_use: The chosen call_id for logging
@@ -129,6 +126,7 @@ def start_logcat(emulator_port=None, call_id=None):
         trace_logger.info("[start_logcat] Logcat buffers cleared successfully")
     except subprocess.CalledProcessError as e:
         trace_logger.error(f"[start_logcat] Failed to clear logcat buffers: {e.stderr}")
+        raise
 
     trace_logger.info("[start_logcat] Starting new logcat process with tags: %s", TAGS)
     cmd = adb_cmd + ["logcat", "-v", "time", "-s"] + TAGS
@@ -143,14 +141,8 @@ def start_logcat(emulator_port=None, call_id=None):
 def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                      last_incall_log_time: float, call_id: str):
     """
-    Parses each log line to detect call state transitions, using the defined PATTERNS.
+    Parses each log line to detect call state transitions.
     Returns (new_state, new_start_time, new_last_incall_log_time).
-    
-    - current_state: The existing CallState
-    - start_time: When the call state was first changed from IDLE (to measure durations)
-    - sip_manager: The SIP manager object to answer/hangup calls
-    - last_incall_log_time: Last timestamp of printing "in call" status
-    - call_id: ID used for logging
     """
     trace_logger = logger.bind(call_trace=True, call_id=call_id)
     new_state = current_state
@@ -158,7 +150,6 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_last_incall_log_time = last_incall_log_time
 
-    # Log raw line for debugging
     trace_logger.debug(f"[call_monitor] Raw logcat line: {line.strip()}")
 
     # Check if in ANSWERED state to log "in call" status every ~5 seconds
@@ -170,31 +161,36 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
             print(colorize("ANSWERED", msg))
             new_last_incall_log_time = now_ts
 
-    # Check for state transitions: RINGING, CONNECTING, ANSWERED, DISCONNECTED
+    # Check for state transitions
     for pattern_state, regex in PATTERNS.items():
-        if regex.search(line):
+        match = regex.search(line)
+        if match:
+            event = match.group("event")
             trace_logger.info(f"[call_monitor] Matched pattern for {pattern_state}: {line.strip()}")
             # RINGING
             if pattern_state == "RINGING" and new_state == CallState.IDLE:
                 new_state = CallState.RINGING
                 start_time = now_ts
-                trace_logger.info(f"[call_monitor] RINGING at {now_str}")
-                print(colorize("RINGING", f"[call_monitor] RINGING at {now_str}"))
+                msg = f"[call_monitor] RINGING at {now_str} | {event}"
+                trace_logger.info(msg)
+                print(colorize("RINGING", msg))
 
             # CONNECTING
             elif pattern_state == "CONNECTING" and new_state in (CallState.IDLE, CallState.RINGING):
                 new_state = CallState.CONNECTING
                 if not start_time:
                     start_time = now_ts
-                trace_logger.info(f"[call_monitor] CONNECTING at {now_str}")
-                print(colorize("CONNECTING", f"[call_monitor] CONNECTING at {now_str}"))
+                msg = f"[call_monitor] CONNECTING at {now_str} | {event}"
+                trace_logger.info(msg)
+                print(colorize("CONNECTING", msg))
 
             # ANSWERED
             elif pattern_state == "ANSWERED" and new_state in (CallState.RINGING, CallState.CONNECTING):
                 new_state = CallState.ANSWERED
                 duration = (now_ts - start_time) if start_time else 0
-                trace_logger.info(f"[call_monitor] ANSWERED at {now_str}, after {duration:.1f}s")
-                print(colorize("ANSWERED", f"[call_monitor] ANSWERED at {now_str}, after {duration:.1f}s"))
+                msg = f"[call_monitor] ANSWERED at {now_str} | {event} | Connected after {duration:.1f}s"
+                trace_logger.info(msg)
+                print(colorize("ANSWERED", msg))
 
                 step_ok = execute_step(
                     step_name="sip_manager.answer_call",
@@ -205,7 +201,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                     description="Answering SIP call"
                 )
                 if not step_ok:
-                    logger.error("[call_monitor] answer_call failed => exit")
+                    trace_logger.error("[call_monitor] answer_call failed => exit")
                     sys.exit(1)
 
                 new_last_incall_log_time = now_ts
@@ -216,8 +212,9 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                 new_state = CallState.DISCONNECTED
                 duration = (now_ts - start_time) if start_time else 0
                 reason_str = "Rejected" if old_state != CallState.ANSWERED else "Ended"
-                trace_logger.info(f"[call_monitor] DISCONNECTED at {now_str}, {reason_str} after {duration:.1f}s")
-                print(colorize("DISCONNECTED", f"[call_monitor] DISCONNECTED at {now_str}, {reason_str} after {duration:.1f}s"))
+                msg = f"[call_monitor] DISCONNECTED at {now_str} | {event} | {reason_str} after {duration:.1f}s"
+                trace_logger.info(msg)
+                print(colorize("DISCONNECTED", msg))
 
                 step_ok = execute_step(
                     step_name="sip_manager.hangup_call",
@@ -228,7 +225,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                     description="Disconnecting SIP call"
                 )
                 if not step_ok:
-                    logger.error("[call_monitor] hangup_call failed => exit")
+                    trace_logger.error("[call_monitor] hangup_call failed => exit")
                     sys.exit(1)
 
                 # Reset to IDLE after disconnection
@@ -236,29 +233,27 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                 start_time = None
                 new_last_incall_log_time = 0.0
 
-            # Break after first matching pattern
             break
     else:
-        # Log unmatched lines with relevant keywords for debugging
+        # Log unmatched lines with relevant keywords
         relevant_keywords = [
-            "tgvoip",
-            "webrtc_voice_engine",
-            "encryptedconnection",
-            "reflectorport",
-            "audioflinger",
-            "audiomanager",
-            "telecom",
-            "voipservice",
-            "activitymanager"
+            "tgvoip", "webrtc_voice_engine", "encryptedconnection", "reflectorport",
+            "audioflinger", "audiomanager", "telecom", "voipservice", "activitymanager"
         ]
         if any(k in line.lower() for k in relevant_keywords):
             if "createTrack_l(): mismatch" not in line:
                 trace_logger.debug(f"[call_monitor] Unmatched line with relevant keywords: {line.strip()}")
+                print(colorize("DEBUG", f"[call_monitor] Unmatched at {now_str} | {line.strip()}"))
+
+    # Debug prolonged CONNECTING state
+    if new_state == CallState.CONNECTING and start_time and (now_ts - start_time) > 10.0:
+        trace_logger.debug(f"[call_monitor] Still in CONNECTING after {(now_ts - start_time):.1f}s")
 
     # Handle timeout after 30 seconds in RINGING/CONNECTING
     if new_state in (CallState.RINGING, CallState.CONNECTING) and start_time and (now_ts - start_time) > 30.0:
-        trace_logger.info("[call_monitor] TIMEOUT after 30s => disconnect")
-        print(colorize("DISCONNECTED", "[call_monitor] TIMEOUT after 30s => disconnect"))
+        msg = f"[call_monitor] TIMEOUT after 30s at {now_str} => disconnect"
+        trace_logger.info(msg)
+        print(colorize("DISCONNECTED", msg))
         step_ok = execute_step(
             step_name="sip_manager.hangup_call",
             step_func=sip_manager.hangup_call,
@@ -268,7 +263,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
             description="Timeout disconnect"
         )
         if not step_ok:
-            logger.error("[call_monitor] timeout hangup_call failed => exit")
+            trace_logger.error("[call_monitor] timeout hangup_call failed => exit")
             sys.exit(1)
 
         new_state = CallState.IDLE
@@ -285,15 +280,21 @@ def monitor_telegram_calls(
 ):
     """
     Monitors Telegram calls by reading ADB logcat for certain tags.
-    If call_id is provided, all logs will bind to that call_id.
-    Otherwise, we'll fall back to 'monitor-{emulator_port}'.
-
-    It displays state transitions (RINGING, CONNECTING, ANSWERED, DISCONNECTED)
-    and logs "in call" duration every ~5s when in ANSWERED state.
-    Additionally, colored console output is provided for easier visual tracking.
+    Displays state transitions and logs "in call" duration every ~5s when in ANSWERED state.
     """
     trace_logger = logger.bind(call_trace=True, call_id=call_id or f"monitor-{emulator_port}")
     trace_logger.info("[monitor_telegram_calls] Starting call monitoring for emulator_port=%s, call_id=%s", emulator_port, call_id)
+
+    # Verify emulator is running
+    adb_cmd = ["adb"]
+    if emulator_port:
+        adb_cmd += ["-s", f"emulator-{emulator_port}"]
+    try:
+        result = subprocess.run(adb_cmd + ["shell", "getprop ro.boot.emulator"], capture_output=True, text=True, timeout=5)
+        trace_logger.info("[monitor_telegram_calls] Emulator check: %s", result.stdout.strip())
+    except subprocess.SubprocessError as e:
+        trace_logger.error(f"[monitor_telegram_calls] Emulator check failed: {str(e)}")
+        return
 
     proc, used_call_id = start_logcat(emulator_port, call_id=call_id)
 
