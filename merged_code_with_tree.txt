@@ -1,0 +1,826 @@
+
+# ===== File: ./README.md =====
+
+# Telegram Call Project
+
+Initiates Telegram voice calls on an Android device/emulator using ADB and Baresip for SIP communication.
+
+## Prerequisites
+- Python 3.8+
+- Android device/emulator with Telegram installed and rooted access
+- ADB (Android Debug Bridge) installed
+- Baresip CLI soft-phone installed
+- Asterisk or compatible SIP server
+- PulseAudio for audio handling
+
+## Setup
+1. Clone the repository:
+   ```bash
+   git clone <repository_url>
+   cd telegram_call_project
+# ===== End of ./README.md =====
+
+
+# ===== File: ./requirements.txt =====
+
+python-dotenv==1.0.0
+# ===== End of ./requirements.txt =====
+
+
+# ===== File: ./test.py =====
+
+import socket
+import json
+
+def send_command(cmd):
+    msg_str = json.dumps(cmd)
+    netstring = f"{len(msg_str)}:{msg_str},"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect(('127.0.0.1', 4444))
+        s.sendall(netstring.encode())
+        response = s.recv(4096)
+        return response.decode()
+
+dial_cmd = {
+    "method": "dial",
+    "params": {
+        "account": "sip:200@135.181.130.186",
+        "target": "sip:100@135.181.130.186"
+    }
+}
+
+resp = send_command(dial_cmd)
+print("Response:", resp)
+
+# ===== End of ./test.py =====
+
+
+# ===== File: ./config/.env =====
+
+ADB_PATH=/home/mohammad/Android/Sdk/platform-tools/adb # تأكد من المسار الصحيح لـ adb
+ASTERISK_HOST=65.21.133.183
+ASTERISK_PORT=5060
+SIP_TRANSPORT_PORT=5060   
+USER_INFO_FILE=/home/mohammad/Documents/mohammadFaisal/telegram_call_project/config/user_info.txt
+PULSE_SINK=default
+PULSE_SOURCE=default
+BARESIP_BIN=/usr/local/bin/baresip  # تأكد من المسار الصحيح لـ baresip
+CALL_UID_FIND_TIMEOUT=2.0
+CALL_UID_FIND_INTERVAL=0.2
+
+
+
+
+# ===== End of ./config/.env =====
+
+
+# ===== File: ./config/user_info.txt =====
+
+SIP_USERNAME=101010
+SIP_PASSWORD=node1_user1
+# ===== End of ./config/user_info.txt =====
+
+
+# ===== File: ./src/baresip_utils.py =====
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+baresip_utils.py
+----------------
+Manages SIP communication using baresip CLI soft-phone.
+Requires environment variables: ASTERISK_HOST, ASTERISK_PORT, SIP_TRANSPORT_PORT,
+USER_INFO_FILE, PULSE_SINK, PULSE_SOURCE, BARESIP_BIN.
+"""
+
+from __future__ import annotations
+import os
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+import socket
+
+from infrastructure.logging.logger import logger
+from utilities.state_management.state_manager import log_state
+
+class BaresipManager:
+    def __init__(self, node_id: str, user_id: str, instance_id: str):
+        self.node_id = node_id
+        self.user_id = user_id
+        self.instance_id = instance_id
+        self.asterisk_host = os.getenv("ASTERISK_HOST") or ""
+        self.asterisk_port = os.getenv("ASTERISK_PORT") or ""
+        self.local_sip_port = os.getenv("SIP_TRANSPORT_PORT") or ""
+        self.pulse_sink = os.getenv("PULSE_SINK") or ""
+        self.pulse_source = os.getenv("PULSE_SOURCE") or ""
+        user_info_file = os.getenv("USER_INFO_FILE") or ""
+        self.baresip_bin = os.getenv("BARESIP_BIN") or ""
+        if not all([self.asterisk_host, self.asterisk_port, self.local_sip_port,
+                    self.pulse_sink, self.pulse_source, user_info_file, self.baresip_bin]):
+            raise ValueError("Missing required environment variables")
+        self.username, self.password = self._parse_user_info(user_info_file)
+        self.cfg_dir = Path.home() / ".baresip"
+        self.proc: Optional[subprocess.Popen] = None
+        self.stdout_thread: Optional[threading.Thread] = None
+        self.cmd_fifo: Optional[str] = None  # Changed to str for ctrl_tcp
+        self.running = False
+        self.current_call_id: Optional[str] = None
+        self.registered = False
+
+    def start(self) -> None:
+        """Start Baresip process."""
+        if self.running:
+            logger.warning("[BaresipManager] Already running")
+            return
+        self._ensure_config()
+        self._spawn_process()
+        self.running = True
+        self.stdout_thread = threading.Thread(target=self._stdout_reader, name="baresip-stdout", daemon=True)
+        self.stdout_thread.start()
+        log_state(
+            state_code="SIP_ENDPOINT_START", operation="call_mode", action="start_endpoint",
+            status="success", details=self._details(), description="baresip endpoint started"
+        )
+
+    def stop(self) -> None:
+        """Stop Baresip process."""
+        if not self.running:
+            return
+        try:
+            self._send_cmd("quit")
+            self.proc.wait(timeout=5)
+        except Exception:
+            self.proc.kill()
+        self.running = False
+        self.proc = None
+        log_state(
+            state_code="SIP_ENDPOINT_STOP", operation="call_mode", action="stop_endpoint",
+            status="success", details=self._details(), description="baresip stopped"
+        )
+
+    def ensure_connected(self, timeout: int = 10) -> bool:
+        """Ensure Baresip is registered with Asterisk."""
+        if not self.running:
+            self.start()
+        return self.wait_registered(timeout=timeout)
+
+    def is_registered(self) -> bool:
+        """Check if registered with Asterisk."""
+        return self.registered
+
+    def wait_registered(self, timeout: int = 10) -> bool:
+        """Wait for registration with Asterisk."""
+        for _ in range(timeout * 10):
+            if self.registered:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def answer_call(self) -> None:
+        """Answer incoming call."""
+        if not self.current_call_id:
+            logger.warning("[BaresipManager] No current call to answer")
+            return
+        self._send_cmd("answer")
+        log_state(
+            state_code="SIP_CALL_ANSWERED", operation="call_mode", action="answer_call",
+            status="success", details=self._details(), description="call answered via baresip"
+        )
+
+    def hangup_call(self) -> None:
+        """Hang up current call."""
+        self._send_cmd("hangup")
+
+    def wait_incoming_call_end(self) -> bool:
+        """Wait for incoming call to end."""
+        while self.running and self.current_call_id is None:
+            time.sleep(0.5)
+        if not self.running:
+            return False
+        while self.running and self.current_call_id is not None:
+            time.sleep(0.5)
+        return True
+
+    def _details(self) -> dict:
+        return {
+            "node_id": self.node_id, "user_id": self.user_id, "instance_id": self.instance_id,
+            "sip_uri": f"sip:{self.username}@{self.asterisk_host}:{self.asterisk_port}"
+        }
+
+    def _ensure_config(self) -> None:
+        """Ensure Baresip config and accounts files exist."""
+        self.cfg_dir.mkdir(exist_ok=True)
+        acc_path = self.cfg_dir / "accounts"
+        if not acc_path.exists():
+            account_line = (
+                f"<sip:{self.username}@{self.asterisk_host}:{self.asterisk_port}>;"
+                f"auth_user={self.username};auth_pass={self.password};answermode=manual;regint=60"
+            )
+            acc_path.write_text(account_line + "\n", encoding="utf-8")
+        cfg_path = self.cfg_dir / "config"
+        if not cfg_path.exists():
+            cfg_path.write_text("\n", encoding="utf-8")
+        cfg_lines = cfg_path.read_text().splitlines()
+
+        def _set(key: str, value: str) -> None:
+            prefix = key + "\t"
+            for i, line in enumerate(cfg_lines):
+                if line.startswith(prefix):
+                    cfg_lines[i] = f"{prefix}{value}"
+                    break
+            else:
+                cfg_lines.append(f"{prefix}{value}")
+
+        _set("sip_listen", f"0.0.0.0:{self.local_sip_port}")
+        _set("ctrl_tcp_listen", "127.0.0.1:4444")
+        _set("audio_source", f"pulse,{self.pulse_source}")
+        _set("audio_player", f"pulse,{self.pulse_sink}")
+        cfg_path.write_text("\n".join(cfg_lines) + "\n", encoding="utf-8")
+
+    
+     
+
+    def _spawn_process(self) -> None:
+        """Spawn Baresip subprocess."""
+        env = os.environ.copy()
+        env["BARESIP_HOME"] = str(self.cfg_dir)
+        env["LD_LIBRARY_PATH"] = "/usr/local/lib/baresip/modules:" + env.get("LD_LIBRARY_PATH", "")
+        cmd = [self.baresip_bin, "-f", str(self.cfg_dir), "-m", "ctrl_tcp"]
+        logger.info("[BaresipManager] Starting baresip with command: %s", cmd)
+        self.proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
+        )
+        logger.info("[BaresipManager] Started PID %s", self.proc.pid)
+        
+        # التحقق من واجهة ctrl_tcp
+        for _ in range(100):  # 10 ثوانٍ
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                s.connect(("127.0.0.1", 4444))
+                s.close()
+                logger.info("[BaresipManager] ctrl_tcp connected at 127.0.0.1:4444")
+                self.cmd_fifo = "tcp:127.0.0.1:4444"
+                break
+            except (ConnectionRefusedError, socket.timeout) as e:
+                logger.debug("[BaresipManager] ctrl_tcp not yet available: %s", str(e))
+                time.sleep(0.1)
+            finally:
+                s.close()
+        
+        # قراءة إخراج baresip للتحقق من التسجيل
+        output = ""
+        for _ in range(300):  # قراءة لمدة 30 ثانية
+            line = self.proc.stdout.readline() if self.proc.stdout else ""
+            if not line:
+                break
+            output += line
+            if "useragent registered successfully" in line.lower():
+                logger.info("[BaresipManager] SIP registration successful: %s", line.strip())
+                self.registered = True
+            elif "connection timed out" in line.lower():
+                logger.error("[BaresipManager] SIP registration failed: %s", line.strip())
+            elif "ctrl_tcp" in line.lower():
+                logger.error("[BaresipManager] ctrl_tcp error: %s", line.strip())
+        logger.debug("[BaresipManager] baresip initial output: %s", output)
+        
+        if not self.cmd_fifo:
+            try:
+                logger.error("[BaresipManager] ctrl_tcp not available, baresip output: %s", output)
+            except Exception as e:
+                logger.error("[BaresipManager] Failed to read baresip output: %s", str(e))
+            finally:
+                if self.proc:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self.proc.kill()
+            raise RuntimeError("ctrl_tcp not available for baresip")
+     
+    def _stdout_reader(self) -> None:
+        """Read Baresip stdout and parse events."""
+        assert self.proc and self.proc.stdout
+        for line in self.proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            logger.debug("[baresip] %s", line)
+            self._parse_event(line)
+            if not self.running:
+                break
+            time.sleep(0.1)
+
+    def _parse_event(self, line: str) -> None:
+        """Parse Baresip output events."""
+        lower = line.lower()
+        if "registered" in lower and "ua" in lower:
+            self.registered = True
+            log_state(
+                state_code="SIP_REGISTRATION_OK", operation="call_mode", action="register_sip_account",
+                status="success", details=self._details(), description="Account registered with Asterisk"
+            )
+        elif "incoming" in lower and "call" in lower:
+            parts = line.split()
+            self.current_call_id = parts[1] if len(parts) > 1 else "unknown"
+            log_state(
+                state_code="SIP_CALL_INCOMING", operation="call_mode", action="incoming_detect",
+                status="initiated", details=self._details(), description="incoming call detected"
+            )
+        elif "answered" in lower:
+            log_state(
+                state_code="SIP_CALL_CONFIRMED", operation="call_mode", action="call_confirmed",
+                status="success", details=self._details(), description="call answered/confirmed"
+            )
+        elif "closed" in lower and "call" in lower:
+            self.current_call_id = None
+            log_state(
+                state_code="SIP_CALL_DISCONNECTED", operation="call_mode", action="call_closed",
+                status="success", details=self._details(), description="call closed"
+            )
+
+    def _send_cmd(self, cmd: str) -> None:
+        """Send command to Baresip via TCP socket."""
+        if not self.cmd_fifo or not self.cmd_fifo.startswith("tcp:"):
+            logger.error("[BaresipManager] ctrl_tcp not ready")
+            return
+        try:
+            host, port = self.cmd_fifo.replace("tcp:", "").split(":")
+            port = int(port)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((host, port))
+                s.sendall((cmd + "\n").encode("utf-8"))
+        except Exception as exc:
+            logger.exception("[BaresipManager] TCP write failed: %s", exc)
+
+    @staticmethod
+    def _parse_user_info(filepath: str) -> tuple[str, str]:
+        """Parse SIP_USERNAME and SIP_PASSWORD from user_info file."""
+        lines = Path(filepath).read_text().splitlines()
+        username, password = None, None
+        for line in lines:
+            if line.startswith("SIP_USERNAME="):
+                username = line.split("=", 1)[1].strip()
+            elif line.startswith("SIP_PASSWORD="):
+                password = line.split("=", 1)[1].strip()
+        if not username or not password:
+            raise ValueError("Missing SIP_USERNAME or SIP_PASSWORD in USER_INFO_FILE")
+        return username, password
+# ===== End of ./src/baresip_utils.py =====
+
+
+# ===== File: ./src/utilities/helpers/call_responses_publisher.py =====
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+call_responses_publisher.py
+--------------------------
+Placeholder for sending call response messages.
+"""
+
+from infrastructure.logging.logger import logger
+
+def send_call_response(response: str, request_id: str, worker_name: str, phone: str) -> None:
+    logger.info(f"[send_call_response] response={response}, request_id={request_id}, worker_name={worker_name}, phone={phone}")
+    # Implement RabbitMQ or other messaging queue logic here
+# ===== End of ./src/utilities/helpers/call_responses_publisher.py =====
+
+
+# ===== File: ./src/utilities/helpers/telegram_utils/call_monitor_tg_utils.py =====
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+call_monitor_tg_utils.py
+------------------------
+Monitors Telegram call logs and SIP events.
+"""
+
+from infrastructure.logging.logger import logger
+from baresip_utils import BaresipManager
+
+def monitor_telegram_calls(sip_manager: BaresipManager, emulator_port: str, output_file: str = None) -> None:
+    logger.info(f"[monitor_telegram_calls] Monitoring calls for emulator_port={emulator_port}")
+    if sip_manager.ensure_connected(timeout=20):  # زيادة المهلة إلى 20 ثانية
+        logger.info("[monitor_telegram_calls] SIP connected, waiting for call events")
+        sip_manager.wait_incoming_call_end()
+    else:
+        logger.error("[monitor_telegram_calls] SIP connection failed, registration status: %s", sip_manager.is_registered())
+# ===== End of ./src/utilities/helpers/telegram_utils/call_monitor_tg_utils.py =====
+
+
+# ===== File: ./src/utilities/state_management/state_manager.py =====
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+state_manager.py
+----------------
+Placeholder for logging state changes.
+"""
+
+from infrastructure.logging.logger import logger
+
+def log_state(state_code: str, operation: str, action: str, status: str, details: dict, description: str) -> None:
+    logger.info(f"[log_state] {state_code}: {operation}/{action} - {status} - {description} - {details}")
+# ===== End of ./src/utilities/state_management/state_manager.py =====
+
+
+# ===== File: ./src/infrastructure/logging/logger.py =====
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+logger.py
+---------
+Placeholder logging module.
+"""
+
+import logging
+
+class Logger:
+    def __init__(self):
+        self.logger = logging.getLogger("telegram_call")
+        self.logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        self.logger.addHandler(handler)
+
+    def bind(self, **kwargs):
+        return self  # Simplified; real implementation may add context
+
+    def info(self, msg, *args, **kwargs):
+        self.logger.info(msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        self.logger.warning(msg, *args, **kwargs)
+
+    def debug(self, msg, *args, **kwargs):
+        self.logger.debug(msg, *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        self.logger.error(msg, *args, **kwargs)
+
+    def exception(self, msg, *args, **kwargs):
+        self.logger.exception(msg, *args, **kwargs)
+
+logger = Logger()
+# ===== End of ./src/infrastructure/logging/logger.py =====
+
+
+# ===== File: ./src/make_call_tg_utils.py =====
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+make_call_tg_utils.py
+---------------------
+Orchestrates a Telegram voice-call from 'Call Mode'.
+- Validates phone number.
+- Ensures contact is in device's Contacts and synced with Telegram.
+- Queries Telegram's cache4.db for userId.
+- Responds with SIP-like codes (180, 484, 502).
+- Uses BaresipManager for SIP call monitoring.
+"""
+
+import os
+import re
+import subprocess
+import time
+import xml.etree.ElementTree as ET
+from typing import Final, Optional, Tuple
+
+from infrastructure.logging.logger import logger
+from baresip_utils import BaresipManager
+from utilities.helpers.telegram_utils.call_monitor_tg_utils import monitor_telegram_calls
+from utilities.helpers.call_responses_publisher import send_call_response
+
+# Constants
+ADB: Final = os.getenv("ADB_PATH", "adb")
+DB_PATH: Final = "/data/data/org.telegram.messenger/files/cache4.db"
+SQLITE_BIN: Final = "sqlite3"
+ACCOUNT_TYPE, ACCOUNT_NAME = "com.android.localprofile", "Local"
+CALL_UID_FIND_TIMEOUT = float(os.getenv("CALL_UID_FIND_TIMEOUT", "2.0"))
+CALL_UID_FIND_INTERVAL = float(os.getenv("CALL_UID_FIND_INTERVAL", "0.2"))
+
+def run(cmd, **kwargs) -> subprocess.CompletedProcess:
+    """Run a subprocess command with output captured."""
+    return subprocess.run(cmd, text=True, capture_output=True, **kwargs)
+
+def valid_phone(p: str) -> bool:
+    """Check if phone number matches +<digits> format, 6-15 digits after '+'."""
+    return re.fullmatch(r"\+\d{6,15}", p) is not None
+
+def is_rooted(device_id: str) -> bool:
+    """Check if Android device is rooted by checking 'uid=0(root)' in 'id' command."""
+    trace_logger = logger.bind(call_trace=True, call_id=device_id)
+    proc = run([ADB, "-s", device_id, "shell", "id"])
+    if proc.returncode != 0:
+        trace_logger.info(f"[is_rooted] ADB error => {proc.stderr}")
+        return False
+    return "uid=0(root)" in proc.stdout
+
+def get_telegram_user_id(device_id: str, phone: str) -> Optional[str]:
+    """Query Telegram's cache4.db for userId by phone number."""
+    trace_logger = logger.bind(call_trace=True, call_id=device_id)
+
+    def _adb_sql(query: str) -> Optional[str]:
+        cmd = f'echo "{query}" | {SQLITE_BIN} {DB_PATH}'
+        proc = run([ADB, "-s", device_id, "shell", cmd])
+        if proc.returncode != 0:
+            trace_logger.info(f"[get_telegram_user_id] SQL error => {proc.stderr}")
+            return None
+        return proc.stdout.strip()
+
+    exact_query = f"SELECT uid FROM users WHERE name = '{phone}'"
+    trace_logger.info(f"[get_telegram_user_id] searching exact name='{phone}'")
+    exact_out = _adb_sql(exact_query)
+    if exact_out and exact_out.isdigit():
+        return exact_out
+
+    partial_query = f"SELECT uid FROM users WHERE name LIKE '%{phone[1:]}%'"
+    trace_logger.info(f"[get_telegram_user_id] searching partial name='{phone[1:]}'")
+    partial_out = _adb_sql(partial_query)
+    if partial_out and partial_out.isdigit():
+        return partial_out
+    return None
+
+def dump_ui(device_id: str) -> Optional[str]:
+    """Dump current UI hierarchy using uiautomator."""
+    trace_logger = logger.bind(call_trace=True, call_id=device_id)
+    start_t = time.time()
+    proc = run([ADB, "-s", device_id, "exec-out", "uiautomator", "dump", "/dev/tty"])
+    if proc.returncode != 0:
+        trace_logger.info(f"[dump_ui] Failed => {proc.stderr}")
+        return None
+    xml_content = proc.stdout.split("UI hierarchy dumped to:")[0].strip()
+    trace_logger.info(f"[dump_ui] took {time.time() - start_t:.2f}s")
+    if xml_content.endswith("</hierarchy>"):
+        return xml_content
+    match = re.search(r"(.*?</hierarchy>)\s*", xml_content, re.DOTALL)
+    return match.group(1) if match else None
+
+def find_element_center(xml_content: str, text: str) -> Optional[Tuple[int, int]]:
+    """Find element by text or content-desc and return center coordinates."""
+    trace_logger = logger.bind(call_trace=True)
+    try:
+        root = ET.fromstring(xml_content)
+        for node in root.iter("node"):
+            node_text = node.get("text", "")
+            node_desc = node.get("content-desc", "")
+            if text.lower() in (node_text + node_desc).lower():
+                bounds_str = node.get("bounds", "")
+                m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_str)
+                if m:
+                    l, t, r, b = map(int, m.groups())
+                    return ((l + r) // 2, (t + b) // 2)
+    except ET.ParseError as e:
+        trace_logger.info(f"[find_element_center] XML parse error => {e}")
+    return None
+
+def wait_for_element(device_id: str, text: str, timeout: float = 2.0, max_attempts: int = 40) -> Optional[Tuple[int, int]]:
+    """Poll UI for element by text or content-desc, return center coords."""
+    trace_logger = logger.bind(call_trace=True, call_id=device_id)
+    trace_logger.info(f"[wait_for_element] searching '{text}' with timeout={timeout}s")
+    start_time = time.time()
+    attempts = 0
+    while (time.time() - start_time) < timeout and attempts < max_attempts:
+        xml = dump_ui(device_id)
+        if xml:
+            coords = find_element_center(xml, text)
+            if coords:
+                trace_logger.info(f"[wait_for_element] found '{text}' => {coords}, attempt={attempts+1}")
+                return coords
+        time.sleep(0.05)
+        attempts += 1
+    trace_logger.info(f"[wait_for_element] timed out => '{text}' not found")
+    return None
+
+def tap(device_id: str, x: int, y: int) -> None:
+    """Perform ADB tap at (x, y)."""
+    trace_logger = logger.bind(call_trace=True, call_id=device_id)
+    trace_logger.info(f"[tap] => x={x}, y={y}")
+    run([ADB, "-s", device_id, "shell", "input", "tap", str(x), str(y)])
+
+def is_telegram_in_foreground(device_id: str) -> bool:
+    """Check if Telegram is in the foreground."""
+    proc = run([ADB, "-s", device_id, "shell", "dumpsys", "window", "windows"])
+    return "org.telegram.messenger" in proc.stdout
+
+def make_telegram_call(
+    adb_port: str,
+    phone: str,
+    contact_name: str,
+    sip_manager: BaresipManager,
+    rabbit_queue_name: str,
+    worker_name: str,
+    request_id: str
+) -> bool:
+    """Main function to initiate Telegram call with Call -> End Call -> Call sequence."""
+    trace_logger = logger.bind(call_trace=True, call_id=phone)
+    trace_logger.info(f"=== make_telegram_call START phone={phone}, contact={contact_name}, request_id={request_id} ===")
+
+    device_id = adb_port if adb_port.startswith("emulator-") else f"emulator-{adb_port}"
+    emulator_port = device_id.replace("emulator-", "")
+
+    # Step 1: Validate phone
+    trace_logger.info("[make_telegram_call] Step 1: Validate phone")
+    if not valid_phone(phone):
+        trace_logger.info("[make_telegram_call] phone invalid => respond 484")
+        send_call_response(response="484", request_id=request_id, worker_name=worker_name, phone=phone)
+        return False
+
+    # Ensure device is rooted
+    trace_logger.info("[make_telegram_call] Checking device root status")
+    if not is_rooted(device_id):
+        trace_logger.info("[make_telegram_call] device not rooted => trying 'adb root'")
+        run([ADB, "-s", device_id, "root"])
+        time.sleep(1)
+
+    # Step 2: Insert contact
+    trace_logger.info("[make_telegram_call] Step 2: adding contact")
+    shell_script = f"""#!/system/bin/sh
+set -e
+NAME="{contact_name}"
+PHONE="{phone}"
+ACC_TYPE="{ACCOUNT_TYPE}"
+ACC_NAME="{ACCOUNT_NAME}"
+exists=$(content query --uri content://com.android.contacts/data \
+  --projection data1 \
+  --where "data1 LIKE '%$PHONE%' AND mimetype='vnd.android.cursor.item/phone_v2'" 2>&1)
+if echo "$exists" | grep -q "Error"; then
+  echo "? query error => $exists"
+  exit 1
+fi
+if echo "$exists" | grep -q "Row:.*data1=$PHONE"; then
+  echo "? contact exists"
+else
+  echo "? inserting contact => $NAME ($PHONE)"
+  ins=$(content insert --uri content://com.android.contacts/raw_contacts \
+      --bind account_type:s:$ACC_TYPE \
+      --bind account_name:s:$ACC_NAME)
+  RAW_ID=$(content query --uri content://com.android.contacts/raw_contacts \
+    --projection _id | tail -n1 | sed -En 's/.*_id=([0-9]+).*/\\1/p')
+  if [ -z "$RAW_ID" ]; then
+    echo "? can't find RAW_ID => fail."
+    exit 1
+  fi
+  content insert --uri content://com.android.contacts/data \
+    --bind raw_contact_id:i:$RAW_ID \
+    --bind mimetype:s:vnd.android.cursor.item/structured_name \
+    --bind data1:s:"$NAME"
+  content insert --uri content://com.android.contacts/data \
+    --bind raw_contact_id:i:$RAW_ID \
+    --bind mimetype:s:vnd.android.cursor.item/phone_v2 \
+    --bind data1:s:"$PHONE" \
+    --bind data2:i:2
+fi
+am force-stop org.telegram.messenger
+sleep 0.3
+am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
+"""
+    contact_proc = run([ADB, "-s", device_id, "shell"], input=shell_script)
+    if contact_proc.returncode != 0:
+        trace_logger.info("[make_telegram_call] contact insertion error => respond 502")
+        send_call_response(response="502", request_id=request_id, worker_name=worker_name, phone=phone)
+        return False
+    trace_logger.info("[make_telegram_call] contact insertion success or contact exists")
+
+    # Step 3: Search userId in Telegram DB
+    trace_logger.info("[make_telegram_call] Step 3: searching for userId")
+    found_uid = None
+    start_time_find_uid = time.time()
+    while (time.time() - start_time_find_uid) < CALL_UID_FIND_TIMEOUT:
+        found_uid = get_telegram_user_id(device_id, phone)
+        if found_uid:
+            break
+        time.sleep(CALL_UID_FIND_INTERVAL)
+    if not found_uid:
+        trace_logger.info("[make_telegram_call] userId not found => respond 484")
+        send_call_response(response="484", request_id=request_id, worker_name=worker_name, phone=phone)
+        return False
+
+    # Step 3.1: Respond 180 (Ringing)
+    trace_logger.info(f"[make_telegram_call] userId={found_uid} => respond 180")
+    send_call_response(response="180", request_id=request_id, worker_name=worker_name, phone=phone)
+
+    # Step 4: Open Telegram chat
+    trace_logger.info("[make_telegram_call] Step 4: open Telegram contact screen")
+    run([
+        ADB, "-s", device_id, "shell", "am", "start",
+        "-n", "org.telegram.messenger/org.telegram.ui.LaunchActivity",
+        "-a", "com.tmessages.openchat",
+        "--el", "userId", found_uid,
+        "--ez", "startInBubble", "false",
+        "--ez", "open_keyboard", "true"
+    ])
+
+    # Call -> End Call -> Call sequence
+    def find_and_tap(text_label: str) -> bool:
+        coords = wait_for_element(device_id, text_label, timeout=8.0, max_attempts=80)
+        if not coords:
+            trace_logger.info(f"[make_telegram_call] '{text_label}' not found => respond 502")
+            send_call_response(response="502", request_id=request_id, worker_name=worker_name, phone=phone)
+            return False
+        tap(device_id, coords[0], coords[1])
+        dump_ui(device_id)
+        if not is_telegram_in_foreground(device_id):
+            trace_logger.info("[make_telegram_call] Telegram lost focus => respond 502")
+            send_call_response(response="502", request_id=request_id, worker_name=worker_name, phone=phone)
+            return False
+        return True
+
+    trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
+    if not find_and_tap("Call"):
+        return False
+    trace_logger.info("[make_telegram_call] Step: 'End Call' button")
+    if not find_and_tap("End Call"):
+        return False
+    trace_logger.info("[make_telegram_call] Step: SECOND 'Call' button")
+    if not find_and_tap("Call"):
+        return False
+
+    # Monitor calls using BaresipManager
+    trace_logger.info("[make_telegram_call] Monitoring Telegram call logs")
+    sip_manager.ensure_connected()
+    monitor_telegram_calls(sip_manager, emulator_port=emulator_port, output_file=None)
+    trace_logger.info("[make_telegram_call] Done")
+    return True
+# ===== End of ./src/make_call_tg_utils.py =====
+
+
+# ===== File: ./src/main.py =====
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+main.py
+-------
+Entry point to initiate a Telegram call.
+"""
+
+import os
+from dotenv import load_dotenv
+from src.make_call_tg_utils import make_telegram_call
+from src.baresip_utils import BaresipManager
+from src.infrastructure.logging.logger import logger
+
+def main():
+    load_dotenv(dotenv_path="config/.env")
+    sip_manager = BaresipManager(node_id="node1", user_id="user1", instance_id="inst1")
+    try:
+        result = make_telegram_call(
+            adb_port="emulator-5556",
+            phone="+962775054337",
+            contact_name="Test Contact",
+            sip_manager=sip_manager,
+            rabbit_queue_name="call_queue",
+            worker_name="worker1",
+            request_id="req123"
+        )
+        logger.info(f"Call result: {'Success' if result else 'Failed'}")
+    finally:
+        sip_manager.stop()
+
+if __name__ == "__main__":
+    main()
+# ===== End of ./src/main.py =====
+
+
+# ===== Project Tree =====
+
+.
+├── config
+│   └── user_info.txt
+├── __init__.py
+├── merge_codes.sh
+├── merged_code_with_tree.txt
+├── README.md
+├── requirements.txt
+├── src
+│   ├── baresip_utils.py
+│   ├── infrastructure
+│   │   ├── __init__.py
+│   │   └── logging
+│   │       ├── __init__.py
+│   │       └── logger.py
+│   ├── __init__.py
+│   ├── main.py
+│   ├── make_call_tg_utils.py
+│   └── utilities
+│       ├── helpers
+│       │   ├── call_responses_publisher.py
+│       │   ├── __init__.py
+│       │   └── telegram_utils
+│       │       ├── call_monitor_tg_utils.py
+│       │       └── __init__.py
+│       ├── __init__.py
+│       └── state_management
+│           ├── __init__.py
+│           └── state_manager.py
+└── test.py
+
+8 directories, 21 files
