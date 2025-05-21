@@ -20,6 +20,7 @@ from typing import Final, Optional, Tuple
 
 from infrastructure.logging.logger import logger
 from baresip_utils import BaresipManager
+from src.utilities.helpers.call_sniffer_utils import start_call_sniffer_process
 from utilities.helpers.telegram_utils.call_monitor_tg_utils import monitor_telegram_calls
 from utilities.helpers.call_responses_publisher import send_call_response
 
@@ -243,7 +244,6 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
         "--ez", "open_keyboard", "true"
     ])
 
-    monitor_telegram_calls(sip_manager, emulator_port=emulator_port, output_file=None)
 
     # Call -> End Call -> Call sequence
     def find_and_tap(text_label: str) -> bool:
@@ -276,6 +276,9 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
             return False
         return "mInputShown=true" in proc.stdout
 
+
+    start_call_sniffer_process(emulator_port=emulator_port)
+
     trace_logger.info("[make_telegram_call] Step: FIRST 'Call' button")
     if find_element("Attach media"):
         if is_keyboard_open(device_id):
@@ -296,6 +299,9 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
     # Monitor calls using BaresipManager
     trace_logger.info("[make_telegram_call] Monitoring Telegram call logs")
     sip_manager.ensure_connected()
+
+
+    monitor_telegram_calls(sip_manager, emulator_port=emulator_port, output_file=None)
 
     trace_logger.info("[make_telegram_call] Done")
     return True
