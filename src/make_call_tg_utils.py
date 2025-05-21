@@ -243,6 +243,8 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
         "--ez", "open_keyboard", "true"
     ])
 
+    monitor_telegram_calls(sip_manager, emulator_port=emulator_port, output_file=None)
+
     # Call -> End Call -> Call sequence
     def find_and_tap(text_label: str) -> bool:
         coords = wait_for_element(device_id, text_label, timeout=8.0, max_attempts=80)
@@ -294,6 +296,6 @@ am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity
     # Monitor calls using BaresipManager
     trace_logger.info("[make_telegram_call] Monitoring Telegram call logs")
     sip_manager.ensure_connected()
-    monitor_telegram_calls(sip_manager, emulator_port=emulator_port, output_file=None)
+
     trace_logger.info("[make_telegram_call] Done")
     return True
