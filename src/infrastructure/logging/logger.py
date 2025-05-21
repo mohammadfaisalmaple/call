@@ -3,7 +3,7 @@
 """
 logger.py
 ---------
-Placeholder logging module.
+Logging module for the Telegram call project.
 """
 
 import logging
@@ -12,8 +12,11 @@ class Logger:
     def __init__(self):
         self.logger = logging.getLogger("telegram_call")
         self.logger.setLevel(logging.DEBUG)
+        # Clear existing handlers to prevent duplicates
+        self.logger.handlers = []
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        handler.setLevel(logging.INFO)  # Set to INFO to reduce debug clutter
         self.logger.addHandler(handler)
 
     def bind(self, **kwargs):

@@ -145,13 +145,19 @@ def start_logcat(emulator_port=None, call_id=None):
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
         trace_logger.info("[start_logcat] Logcat process started with PID %s", proc.pid)
+        # Verify logcat is producing output
+        time.sleep(1)
+        if proc.poll() is not None:
+            stderr_output = proc.stderr.read() if proc.stderr else "No stderr"
+            trace_logger.error(f"[start_logcat] Logcat process terminated early: {stderr_output}")
+            raise RuntimeError("Logcat process failed to start")
         return proc, call_id_to_use
     except Exception as e:
         trace_logger.error(f"[start_logcat] Failed to start logcat: {str(e)}")
         raise
 
 def process_log_line(line, current_state, start_time, sip_manager: SipManager,
-                     last_incall_log_time: float, call_id: str):
+                     last_incall_log_time: float, call_id: str, log_file):
     """
     Parses each log line to detect call state transitions.
     Logs states clearly as [CALL_STATE] RINGING, etc., in console and log file.
@@ -162,6 +168,9 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
     now_ts = time.time()
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_last_incall_log_time = last_incall_log_time
+
+    # Log all lines for debugging
+    trace_logger.debug(f"[call_monitor] Raw logcat line: {line.strip()}")
 
     # Check for state transitions
     for pattern_state, regex in PATTERNS.items():
@@ -174,7 +183,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                 start_time = now_ts
                 msg = f"{now_str} | {event}"
                 print(colorize("RINGING", msg))
-                write_state_to_log(f, "RINGING", now_str, event=event)
+                write_state_to_log(log_file, "RINGING", now_str, event=event)
                 trace_logger.info(f"[CALL_STATE] RINGING | {event}")
 
             # CONNECTING
@@ -183,7 +192,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                 start_time = start_time or now_ts
                 msg = f"{now_str} | {event}"
                 print(colorize("CONNECTING", msg))
-                write_state_to_log(f, "CONNECTING", now_str, event=event)
+                write_state_to_log(log_file, "CONNECTING", now_str, event=event)
                 trace_logger.info(f"[CALL_STATE] CONNECTING | {event}")
 
             # ANSWERED
@@ -192,7 +201,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                 duration = (now_ts - start_time) if start_time else 0
                 msg = f"{now_str} | {event} | Connected after {duration:.1f}s"
                 print(colorize("ANSWERED", msg))
-                write_state_to_log(f, "ANSWERED", now_str, duration, event)
+                write_state_to_log(log_file, "ANSWERED", now_str, duration, event)
                 trace_logger.info(f"[CALL_STATE] ANSWERED | {event} (Duration: {duration:.1f}s)")
 
                 step_ok = execute_step(
@@ -217,7 +226,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                 reason_str = "Rejected" if old_state != CallState.ANSWERED else "Ended"
                 msg = f"{now_str} | {event} | {reason_str} after {duration:.1f}s"
                 print(colorize("DISCONNECTED", msg))
-                write_state_to_log(f, "DISCONNECTED", now_str, duration, event)
+                write_state_to_log(log_file, "DISCONNECTED", now_str, duration, event)
                 trace_logger.info(f"[CALL_STATE] DISCONNECTED | {event} ({reason_str}, Duration: {duration:.1f}s)")
 
                 step_ok = execute_step(
@@ -259,7 +268,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
         duration = now_ts - start_time
         msg = f"{now_str} | Timeout after 30s"
         print(colorize("DISCONNECTED", msg))
-        write_state_to_log(f, "DISCONNECTED", now_str, duration, "Timeout")
+        write_state_to_log(log_file, "DISCONNECTED", now_str, duration, "Timeout")
         trace_logger.info(f"[CALL_STATE] DISCONNECTED | Timeout after 30s")
 
         step_ok = execute_step(
@@ -309,6 +318,8 @@ def monitor_telegram_calls(
         result = subprocess.run(adb_cmd + ["shell", "dumpsys activity | grep mResumedActivity"], capture_output=True, text=True, timeout=5)
         is_foreground = "org.telegram.messenger" in result.stdout
         trace_logger.info("[monitor_telegram_calls] Telegram in foreground: %s", is_foreground)
+        if not is_foreground:
+            trace_logger.warning("[monitor_telegram_calls] Telegram not in foreground, call detection may fail")
     except subprocess.SubprocessError as e:
         trace_logger.error(f"[monitor_telegram_calls] Telegram foreground check failed: {str(e)}")
 
@@ -329,17 +340,19 @@ def monitor_telegram_calls(
         Path(output_file).parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, "w", encoding="utf-8") as f:
             for line in proc.stdout:
-                f.write(line)
+                line = line.rstrip()
+                f.write(line + "\n")
                 current_state, call_start_time, last_incall_log_time = process_log_line(
                     line,
                     current_state,
                     call_start_time,
                     sip_manager,
                     last_incall_log_time,
-                    used_call_id
+                    used_call_id,
+                    log_file=f
                 )
     except KeyboardInterrupt:
-        trace_logger.info("[monitor_telegram_calls] KeyboardInterrupt => stopping logcat.")
+        trace_logger.info("[monitor_telegram_calls] KeyboardInterrupt => stopping logcat")
     except Exception as e:
         trace_logger.error(f"[monitor_telegram_calls] Error in logcat processing: {str(e)}")
     finally:

@@ -308,8 +308,8 @@ class BaresipManager:
                 details=self._details(),
                 description="Call closed"
             )
-
-    def _send_cmd(self, cmd: str) -> None:
+            
+    def _send_cmd(self, cmd: str, retries: int = 3, retry_delay: float = 1.0) -> None:
         if not self.cmd_fifo or not self.cmd_fifo.startswith("tcp:"):
             logger.error("[BaresipManager] ctrl_tcp not ready")
             return
@@ -319,16 +319,26 @@ class BaresipManager:
             cmd_bytes = cmd.encode("utf-8")
             netstring = f"{len(cmd_bytes)}:{cmd},".encode("utf-8")
             logger.debug("[BaresipManager] Sending netstring command: %s", netstring)
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(5)  # مهلة 5 ثوانٍ
-                s.connect((host, port))
-                s.sendall(netstring)
-                response = s.recv(4096).decode("utf-8", errors="ignore")  # قراءة الرد
-                logger.info("[BaresipManager] Successfully sent command: %s, response: %s", cmd, response)
+            for attempt in range(retries):
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(5)
+                        s.connect((host, port))
+                        s.sendall(netstring)
+                        response = s.recv(4096).decode("utf-8", errors="ignore")
+                        logger.info("[BaresipManager] Successfully sent command: %s, response: %s", cmd, response)
+                        return
+                except (ConnectionRefusedError, socket.timeout, ConnectionResetError) as exc:
+                    logger.warning("[BaresipManager] TCP write attempt %d failed: %s", attempt + 1, str(exc))
+                    if attempt < retries - 1:
+                        time.sleep(retry_delay)
+                    continue
+            logger.error("[BaresipManager] All TCP write attempts failed for command: %s", cmd)
+            raise RuntimeError("Failed to send command to Baresip after retries")
         except Exception as exc:
             logger.error("[BaresipManager] TCP write failed: %s", str(exc))
             raise
-        
+
     @staticmethod
     def _parse_user_info(filepath: str) -> tuple[str, str]:
         """Parse SIP_USERNAME and SIP_PASSWORD from user_info file."""
