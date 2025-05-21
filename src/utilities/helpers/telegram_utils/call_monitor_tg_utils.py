@@ -1,16 +1,18 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 call_monitor_tg_utils.py
 ------------------------
-Monitors Telegram calls by reading ADB logcat for specific tags and detecting call state transitions:
+Monitors Telegram VoIP calls by reading ADB logcat for specific tags and detecting call state transitions:
     - RINGING
     - CONNECTING
     - ANSWERED
     - DISCONNECTED
 Integrates with SipManager to answer or disconnect SIP calls.
-Logs states clearly as [CALL_STATE] RINGING, etc., in both console and log file.
-Enhanced with debugging to identify missing state transitions.
+Logs states clearly as [STATE] YYYY-MM-DD HH:MM:SS | MM-DD HH:MM:SS.mmm in console and log file.
+Optimized for minimal output, excluding noise (e.g., WebRTC, emulator artifacts).
+Supports UTC+3 timezone (Asia/Riyadh) and emulator environments.
 """
 
 import subprocess
@@ -20,6 +22,7 @@ import time
 import sys
 from enum import Enum
 from pathlib import Path
+import pytz
 
 from infrastructure.logging.logger import logger
 from baresip_utils import BaresipManager as SipManager
@@ -50,6 +53,7 @@ def colorize(state_str: str, message: str) -> str:
     color = COLOR_CODES.get(state_str, COLOR_CODES["RESET"])
     return f"{color}[{state_str}] {message}{COLOR_CODES['RESET']}"
 
+# Monitored logcat tags (minimal set for Telegram VoIP)
 TAGS = [
     "tgvoip:V", "tgvoip:D", "tgvoip:I", "tgvoip:W", "tgvoip:E",
     "MediaFocusControl:I", "MediaFocusControl:D",
@@ -70,50 +74,37 @@ TAGS = [
     "*:I", "*:D"
 ]
 
+# Regex patterns for call states (specific to Telegram VoIP)
 PATTERNS = {
     "RINGING": re.compile(
-        r"(?P<event>START\s+u0\s+\{act=voip.*cmp=org\.telegram\.messenger/.*|"
-        r"tgvoip.*(Initiating call|Call ringing|set network type:.*active interface)|"
-        r"Telecom.*(INCOMING_CALL|CALL_RINGING))",
+        r"ActivityTaskManager.*START\s+u0\s+\{act=voip.*cmp=org\.telegram\.messenger/org\.telegram\.ui\.LaunchActivity\}|"
+        r"tgvoip.*(Initiating call|Call ringing)",
         re.IGNORECASE
     ),
     "CONNECTING": re.compile(
-        r"(?P<event>requestAudioFocus.*USAGE_VOICE_COMMUNICATION|"
-        r"VoIPService.*startOutgoingCall|"
-        r"Telecom.*NEW_OUTGOING_CALL|"
-        r"tgvoip.*(Connecting|Starting connection|Bound to local UDP port|Receive thread starting|Sending UDP ping)|"
-        r"webrtc_voice_engine.*(AddSendStream|AddRecvStream|SetSenderParameters|SetReceiverParameters)|"
-        r"EncryptedConnection.*(SEND:empty|processSignalingData)|"
-        r"ReflectorPort.*(sending ping)|"
-        r"ActivityManager.*(Starting activity: Intent.*org\.telegram\.messenger))",
+        r"MediaFocusControl.*requestAudioFocus.*USAGE_VOICE_COMMUNICATION.*callingPack=org\.telegram\.messenger|"
+        r"tgvoip.*(Connecting|Call state changed to 2|Starting connection)|"
+        r"Telecom.*NEW_OUTGOING_CALL",
         re.IGNORECASE
     ),
     "ANSWERED": re.compile(
-        r"(?P<event>tgvoip.*(First audio packet - setting state to ESTABLISHED|Call state changed to 3|Call established|Call connected)|"
-        r"AudioFlinger.*(thread.*ready to run|Track created successfully|start output|audio stream started)|"
-        r"AudioManager.*MODE_IN_COMMUNICATION|"
-        r"MediaFocusControl.*AUDIOFOCUS_GAIN)",
+        r"tgvoip.*(First audio packet - setting state to ESTABLISHED|Call state changed to 3|Call established|Call connected)|"
+        r"AudioFlinger.*thread.*ready to run",
         re.IGNORECASE
     ),
     "DISCONNECTED": re.compile(
-        r"(?P<event>abandonAudioFocus|"
-        r"tgvoip.*(Call ended|Call rejected|Call terminated)|"
-        r"Telecom.*(CALL_DISCONNECTED|CALL_REJECTED)|"
-        r"MediaFocusControl.*AUDIOFOCUS_LOSS|"
-        r"AudioManager.*MODE_NORMAL)",
+        r"MediaFocusControl.*abandonAudioFocus.*callingPack=org\.telegram\.messenger|"
+        r"tgvoip.*(Call ended|Call rejected|Call terminated|User-Initiated Abort)|"
+        r"Telecom.*(CALL_DISCONNECTED|CALL_REJECTED)",
         re.IGNORECASE
     )
 }
 
-def write_state_to_log(file, state: str, timestamp: str, duration: float = None, event: str = None):
+def write_state_to_log(file, state: str, timestamp: str, timestamp_raw: str):
     """
-    Write call state to the log file in a clear format.
+    Write call state to the log file in the format [STATE] YYYY-MM-DD HH:MM:SS | MM-DD HH:MM:SS.mmm.
     """
-    state_line = f"[{timestamp}] [CALL_STATE] {state}"
-    if duration is not None:
-        state_line += f" (Duration: {duration:.1f}s)"
-    if event:
-        state_line += f" | {event}"
+    state_line = f"[{state}] {timestamp} | {timestamp_raw}"
     file.write(f"{state_line}\n")
     file.flush()
 
@@ -162,50 +153,62 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                      last_incall_log_time: float, call_id: str, log_file):
     """
     Parses each log line to detect call state transitions.
-    Logs states clearly as [CALL_STATE] RINGING, etc., in console and log file.
+    Logs states as [STATE] YYYY-MM-DD HH:MM:SS | MM-DD HH:MM:SS.mmm in console and log file.
     Returns (new_state, new_start_time, new_last_incall_log_time).
     """
     trace_logger = logger.bind(call_trace=True, call_id=call_id)
     new_state = current_state
-    now_ts = time.time()
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     new_last_incall_log_time = last_incall_log_time
 
-    # Log all lines for debugging
-    print(colorize("DEBUG", f"{now_str} | Raw logcat: {line.strip()}"))
-    trace_logger.debug(f"[call_monitor] Raw logcat line: {line.strip()}")
+    # Skip lines without monitored tags or with noise
+    if not any(tag in line for tag in TAGS) or any(s in line for s in ["android.hardware.audio", "com.android.systemui", "AudioManager.*Use of stream types is deprecated"]):
+        return new_state, start_time, new_last_incall_log_time
+
+    # Extract timestamp (e.g., "05-21 13:34:05.786")
+    timestamp_match = re.search(r"(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})", line)
+    if not timestamp_match:
+        return new_state, start_time, new_last_incall_log_time
+    timestamp_raw = timestamp_match.group(1)
+
+    # Parse timestamp (assume 2025, convert to UTC+3)
+    try:
+        timestamp = datetime.datetime.strptime(f"2025-{timestamp_raw}", "%Y-%m-%d %H:%M:%S.%f")
+        timezone = pytz.timezone("Asia/Riyadh")  # UTC+3
+        timestamp = timezone.localize(timestamp)
+        timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return new_state, start_time, new_last_incall_log_time
 
     # Check for state transitions
     for pattern_state, regex in PATTERNS.items():
         match = regex.search(line)
         if match:
-            event = match.group("event")
+            now_ts = time.time()
             # RINGING
             if pattern_state == "RINGING" and new_state == CallState.IDLE:
                 new_state = CallState.RINGING
                 start_time = now_ts
-                msg = f"{now_str} | {event}"
+                msg = f"{timestamp_str} | {timestamp_raw}"
                 print(colorize("RINGING", msg))
-                write_state_to_log(log_file, "RINGING", now_str, event=event)
-                trace_logger.info(f"[CALL_STATE] RINGING | {event}")
+                write_state_to_log(log_file, "RINGING", timestamp_str, timestamp_raw)
+                trace_logger.info(f"[CALL_STATE] RINGING | {timestamp_raw}")
 
             # CONNECTING
             elif pattern_state == "CONNECTING" and new_state in (CallState.IDLE, CallState.RINGING):
                 new_state = CallState.CONNECTING
                 start_time = start_time or now_ts
-                msg = f"{now_str} | {event}"
+                msg = f"{timestamp_str} | {timestamp_raw}"
                 print(colorize("CONNECTING", msg))
-                write_state_to_log(log_file, "CONNECTING", now_str, event=event)
-                trace_logger.info(f"[CALL_STATE] CONNECTING | {event}")
+                write_state_to_log(log_file, "CONNECTING", timestamp_str, timestamp_raw)
+                trace_logger.info(f"[CALL_STATE] CONNECTING | {timestamp_raw}")
 
             # ANSWERED
             elif pattern_state == "ANSWERED" and new_state in (CallState.RINGING, CallState.CONNECTING):
                 new_state = CallState.ANSWERED
-                duration = (now_ts - start_time) if start_time else 0
-                msg = f"{now_str} | {event} | Connected after {duration:.1f}s"
+                msg = f"{timestamp_str} | {timestamp_raw}"
                 print(colorize("ANSWERED", msg))
-                write_state_to_log(log_file, "ANSWERED", now_str, duration, event)
-                trace_logger.info(f"[CALL_STATE] ANSWERED | {event} (Duration: {duration:.1f}s)")
+                write_state_to_log(log_file, "ANSWERED", timestamp_str, timestamp_raw)
+                trace_logger.info(f"[CALL_STATE] ANSWERED | {timestamp_raw}")
 
                 step_ok = execute_step(
                     step_name="sip_manager.answer_call",
@@ -223,14 +226,11 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
 
             # DISCONNECTED
             elif pattern_state == "DISCONNECTED" and new_state in (CallState.RINGING, CallState.CONNECTING, CallState.ANSWERED):
-                old_state = new_state
                 new_state = CallState.DISCONNECTED
-                duration = (now_ts - start_time) if start_time else 0
-                reason_str = "Rejected" if old_state != CallState.ANSWERED else "Ended"
-                msg = f"{now_str} | {event} | {reason_str} after {duration:.1f}s"
+                msg = f"{timestamp_str} | {timestamp_raw}"
                 print(colorize("DISCONNECTED", msg))
-                write_state_to_log(log_file, "DISCONNECTED", now_str, duration, event)
-                trace_logger.info(f"[CALL_STATE] DISCONNECTED | {event} ({reason_str}, Duration: {duration:.1f}s)")
+                write_state_to_log(log_file, "DISCONNECTED", timestamp_str, timestamp_raw)
+                trace_logger.info(f"[CALL_STATE] DISCONNECTED | {timestamp_raw}")
 
                 step_ok = execute_step(
                     step_name="sip_manager.hangup_call",
@@ -249,29 +249,20 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
                 new_last_incall_log_time = 0.0
 
             break
-    else:
-        # Log unmatched lines with relevant keywords
-        relevant_keywords = [
-            "tgvoip", "webrtc_voice_engine", "encryptedconnection", "reflectorport",
-            "audioflinger", "audiomanager", "telecom", "voipservice", "activitymanager"
-        ]
-        if any(k in line.lower() for k in relevant_keywords):
-            if "createTrack_l(): mismatch" not in line:
-                print(colorize("DEBUG", f"{now_str} | Unmatched (Potential state?): {line.strip()}"))
-                trace_logger.debug(f"[call_monitor] Unmatched line with relevant keywords: {line.strip()}")
 
-    # Debug prolonged CONNECTING state
+    # Optional debugging for prolonged CONNECTING or timeouts (suppressed by default)
+    """
+    now_ts = time.time()
     if new_state == CallState.CONNECTING and start_time and (now_ts - start_time) > 10.0:
         duration = now_ts - start_time
-        print(colorize("DEBUG", f"{now_str} | Still in CONNECTING after {duration:.1f}s"))
+        print(colorize("DEBUG", f"{timestamp_str} | Still in CONNECTING after {duration:.1f}s"))
         trace_logger.debug(f"[call_monitor] Still in CONNECTING after {duration:.1f}s")
 
-    # Handle timeout after 60 seconds in RINGING/CONNECTING
     if new_state in (CallState.RINGING, CallState.CONNECTING) and start_time and (now_ts - start_time) > 60.0:
         duration = now_ts - start_time
-        msg = f"{now_str} | Timeout after 60s"
+        msg = f"{timestamp_str} | Timeout after 60s"
         print(colorize("DISCONNECTED", msg))
-        write_state_to_log(log_file, "DISCONNECTED", now_str, duration, "Timeout")
+        write_state_to_log(log_file, "DISCONNECTED", timestamp_str, "Timeout")
         trace_logger.info(f"[CALL_STATE] DISCONNECTED | Timeout after 60s")
 
         step_ok = execute_step(
@@ -289,6 +280,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
         new_state = CallState.IDLE
         start_time = None
         new_last_incall_log_time = 0.0
+    """
 
     return new_state, start_time, new_last_incall_log_time
 
@@ -300,7 +292,7 @@ def monitor_telegram_calls(
 ):
     """
     Monitors Telegram calls by reading ADB logcat for certain tags.
-    Logs state transitions clearly as [CALL_STATE] RINGING, etc., in console and log file.
+    Logs state transitions as [STATE] YYYY-MM-DD HH:MM:SS | MM-DD HH:MM:SS.mmm in console and log file.
     """
     trace_logger = logger.bind(call_trace=True, call_id=call_id or f"monitor-{emulator_port}")
     trace_logger.info("[monitor_telegram_calls] Starting call monitoring for emulator_port=%s, call_id=%s", emulator_port, call_id)
@@ -334,10 +326,10 @@ def monitor_telegram_calls(
 
     if not output_file:
         ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"tg_voip_raw_{ts_str}.log"
+        output_file = f"tg_voip_states_{ts_str}.log"
 
     trace_logger.info(f"[monitor_telegram_calls] START, logging to {output_file}")
-    print(colorize("IDLE", f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Logging started, saving to {output_file}"))
+    print(colorize("IDLE", f"{datetime.datetime.now(pytz.timezone('Asia/Riyadh')).strftime('%Y-%m-%d %H:%M:%S')} | Logging started, saving to {output_file}"))
 
     current_state = CallState.IDLE
     call_start_time = None
@@ -370,5 +362,5 @@ def monitor_telegram_calls(
         except subprocess.TimeoutExpired:
             proc.kill()
         trace_logger.info(f"[monitor_telegram_calls] STOP => saved logs to {output_file}")
-        print(colorize("IDLE", f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Logcat stopped, saved to {output_file}"))
+        print(colorize("IDLE", f"{datetime.datetime.now(pytz.timezone('Asia/Riyadh')).strftime('%Y-%m-%d %H:%M:%S')} | Logcat stopped, saved to {output_file}"))
         sip_manager.stop()
