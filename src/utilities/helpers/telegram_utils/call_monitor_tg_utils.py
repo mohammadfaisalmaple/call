@@ -65,7 +65,9 @@ TAGS = [
     "ActivityTaskManager:I", "ActivityManager:I", "ActivityManager:D",
     "webrtc_voice_engine:I", "webrtc_voice_engine:D",
     "EncryptedConnection:I", "EncryptedConnection:D",
-    "ReflectorPort:I", "ReflectorPort:D", "ReflectorPort:W"
+    "ReflectorPort:I", "ReflectorPort:D", "ReflectorPort:W",
+    # Added for debugging
+    "*:I", "*:D"
 ]
 
 PATTERNS = {
@@ -145,7 +147,7 @@ def start_logcat(emulator_port=None, call_id=None):
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
         trace_logger.info("[start_logcat] Logcat process started with PID %s", proc.pid)
-        # Verify logcat is producing output
+        # Verify logcat is running
         time.sleep(1)
         if proc.poll() is not None:
             stderr_output = proc.stderr.read() if proc.stderr else "No stderr"
@@ -170,6 +172,7 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
     new_last_incall_log_time = last_incall_log_time
 
     # Log all lines for debugging
+    print(colorize("DEBUG", f"{now_str} | Raw logcat: {line.strip()}"))
     trace_logger.debug(f"[call_monitor] Raw logcat line: {line.strip()}")
 
     # Check for state transitions
@@ -263,13 +266,13 @@ def process_log_line(line, current_state, start_time, sip_manager: SipManager,
         print(colorize("DEBUG", f"{now_str} | Still in CONNECTING after {duration:.1f}s"))
         trace_logger.debug(f"[call_monitor] Still in CONNECTING after {duration:.1f}s")
 
-    # Handle timeout after 30 seconds in RINGING/CONNECTING
-    if new_state in (CallState.RINGING, CallState.CONNECTING) and start_time and (now_ts - start_time) > 30.0:
+    # Handle timeout after 60 seconds in RINGING/CONNECTING
+    if new_state in (CallState.RINGING, CallState.CONNECTING) and start_time and (now_ts - start_time) > 60.0:
         duration = now_ts - start_time
-        msg = f"{now_str} | Timeout after 30s"
+        msg = f"{now_str} | Timeout after 60s"
         print(colorize("DISCONNECTED", msg))
         write_state_to_log(log_file, "DISCONNECTED", now_str, duration, "Timeout")
-        trace_logger.info(f"[CALL_STATE] DISCONNECTED | Timeout after 30s")
+        trace_logger.info(f"[CALL_STATE] DISCONNECTED | Timeout after 60s")
 
         step_ok = execute_step(
             step_name="sip_manager.hangup_call",
@@ -309,6 +312,8 @@ def monitor_telegram_calls(
     try:
         result = subprocess.run(adb_cmd + ["shell", "getprop ro.boot.emulator"], capture_output=True, text=True, timeout=5)
         trace_logger.info("[monitor_telegram_calls] Emulator check: %s", result.stdout.strip() or "No output")
+        if not result.stdout.strip():
+            trace_logger.warning("[monitor_telegram_calls] Emulator check returned no output, ADB connection may be unstable")
     except subprocess.SubprocessError as e:
         trace_logger.error(f"[monitor_telegram_calls] Emulator check failed: {str(e)}")
         return
@@ -319,7 +324,9 @@ def monitor_telegram_calls(
         is_foreground = "org.telegram.messenger" in result.stdout
         trace_logger.info("[monitor_telegram_calls] Telegram in foreground: %s", is_foreground)
         if not is_foreground:
-            trace_logger.warning("[monitor_telegram_calls] Telegram not in foreground, call detection may fail")
+            trace_logger.warning("[monitor_telegram_calls] Telegram not in foreground, attempting to bring to foreground")
+            subprocess.run(adb_cmd + ["shell", "am start -n org.telegram.messenger/org.telegram.ui.LaunchActivity"], capture_output=True, text=True)
+            time.sleep(2)  # Wait for app to launch
     except subprocess.SubprocessError as e:
         trace_logger.error(f"[monitor_telegram_calls] Telegram foreground check failed: {str(e)}")
 
@@ -353,6 +360,7 @@ def monitor_telegram_calls(
                 )
     except KeyboardInterrupt:
         trace_logger.info("[monitor_telegram_calls] KeyboardInterrupt => stopping logcat")
+        sip_manager.stop()
     except Exception as e:
         trace_logger.error(f"[monitor_telegram_calls] Error in logcat processing: {str(e)}")
     finally:
@@ -363,3 +371,4 @@ def monitor_telegram_calls(
             proc.kill()
         trace_logger.info(f"[monitor_telegram_calls] STOP => saved logs to {output_file}")
         print(colorize("IDLE", f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Logcat stopped, saved to {output_file}"))
+        sip_manager.stop()
